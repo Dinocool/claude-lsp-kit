@@ -44,7 +44,7 @@ export function readFrames(input, onMessage) {
 // old manager whenever a release forgot the bump.
 // languages.mjs reads its extension maps from plugin.json, so they count too
 // (not the whole file: a version bump alone keeps the manager).
-const MANAGER_CODE = ['manager.mjs', 'rpc.mjs', 'languages.mjs'];
+const MANAGER_CODE = ['manager.mjs', 'rpc.mjs', 'languages.mjs', 'processes.mjs'];
 const protocol = () => {
 	const hash = createHash('sha256');
 	for (const file of MANAGER_CODE) hash.update(readFileSync(new URL(file, import.meta.url)));

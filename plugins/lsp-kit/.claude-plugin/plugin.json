@@ -1,7 +1,7 @@
 {
 	"name": "lsp-kit",
 	"description": "Svelte, TypeScript/JavaScript, Rust and Lua language servers for Claude Code's LSP tool, behind one machine-wide manager: native file watching instead of the servers' whole-tree fallbacks, one bounded server per git worktree shared by every session, nested Cargo crates linked; hooks advertise the LSP and steer symbol work to it.",
-	"version": "3.1.0",
+	"version": "3.2.0",
 	"author": { "name": "Dinocool", "url": "https://github.com/Dinocool" },
 	"repository": "https://github.com/Dinocool/claude-lsp-kit",
 	"license": "MIT",

@@ -91,6 +91,8 @@ junctions); each session only ever sees its own spelling.
 - At most 10 servers run machine-wide (`LSP_KIT_MAX_SERVERS`). Starting one
   more stops the least recently used server without a request in flight. If
   every server has one, the cap is exceeded and logged.
+- The servers may use 12 GB together (`LSP_KIT_MAX_MEMORY_MB`, in MB). See
+  [Memory](#memory).
 - A server that stops, crashes or is killed starts again on the next request
   for its checkout.
 - When a session ends, its documents are released; its servers stay for
@@ -100,17 +102,69 @@ junctions); each session only ever sees its own spelling.
   that reason, and each session's next request starts a new manager. If the
   manager can't be started or reached, every request fails with the reason.
   There is no per-session fallback.
+- What a dead manager leaves behind is stopped when the next manager starts.
+  See [Leftover servers](#leftover-servers).
 - The manager runs with the environment of the session that started it.
+
+### Memory
+
+Memory per server grows with the checkout. Measured: rust-analyzer about
+3.5 GB, LuaLS about 1.4 GB, TypeScript 7 about 0.4 GB on a mid-sized SvelteKit
+repo with a few files open (more for each project it loads). Eight sessions'
+own servers once took 24 GB and the machine ran out of commit.
+
+- Once a minute (or every `LSP_KIT_IDLE_MS`, if shorter) the manager measures
+  each server. While the servers together use more than the limit, the least
+  recently used server without a request in flight stops. If every server
+  left has one, the limit is exceeded and logged.
+- A server's memory is its own plus its child processes': rust-analyzer's
+  proc-macro servers and cargo check use memory on its behalf, and end with
+  it.
+  - On Windows it is commit charge (Win32_Process `PageFileUsage`), what the
+    machine ran out of.
+  - Elsewhere it is resident memory (`ps` rss).
+- A server that alone uses more than the limit stops whenever it has no
+  request in flight, like any other. The log names it once, in capitals.
+- The log shows each server's memory when first measured, after each change
+  of 10% or more, and at its stop, for example
+  `Rust server #2 (pid 1234, 3 processes) uses 3.4 GB`.
+- A failed measurement is logged, and the limit isn't applied until the next
+  one succeeds.
+- Measuring lists every process with one PowerShell `Get-CimInstance` (Windows)
+  or one `ps`. No npm library fits:
+  - [pidusage](https://www.npmjs.com/package/pidusage) reads working sets,
+    which Windows trims under memory pressure, one process at a time.
+  - [ps-list](https://www.npmjs.com/package/ps-list) has no memory on Windows.
+  - [systeminformation](https://www.npmjs.com/package/systeminformation) runs
+    the same query in a 1 MB package, and plugins have no install step.
+
+### Leftover servers
+
+A server's processes can outlive its manager.
+- On Windows, Node puts a manager's servers in a job that ends them with the
+  manager, but not the servers' own child processes.
+- Elsewhere, a server that hangs past its manager's crash never notices it.
+
+Each manager records the processes of its servers on every measurement, in
+`lsp-kit-servers-<user>-<pid>-<start>.json` in the plugin data directory. The
+next manager to start stops every recorded process that's still running
+while the manager that recorded it is gone, with its child processes. The log
+names the language, checkout, pids and the gone manager.
+
+- A process counts as lsp-kit's by its pid and start time together, so a
+  later process that reuses the pid is never stopped.
+- A server lsp-kit didn't start, such as an editor's own rust-analyzer, is
+  never stopped. It isn't in any record.
+- A server that starts and is left behind within one measurement interval
+  isn't recorded yet, so it isn't stopped.
+- Processes left by lsp-kit before 3.2.0 have no record and aren't stopped.
 
 ### Limits
 
 - Recursive `fs.watch` is native and cheap on Windows and macOS. On Linux,
   Node 20+ emulates it in JavaScript and watches every directory, which can
   hit inotify limits in very large trees.
-- Memory per server grows with the checkout. Measured: rust-analyzer about
-  3.5 GB, LuaLS about 1.4 GB, TypeScript 7 about 0.4 GB on a mid-sized
-  SvelteKit repo with a few files open (more for each project it loads). The
-  cap counts servers, not memory.
+- The memory measurement and leftover sweep are tested on Windows only.
 
 **5. Per-language setup.**
 - **Rust:** rust-analyzer only looks for `Cargo.toml` at the root and one
@@ -251,11 +305,14 @@ started with, and with it its manager.
   log lines.
 - Start and stop events are always logged, as `lsp-kit: <Lang> server #n for
   <root> (<n> live, pid <pid>)`, and each session's start as `session #n
-  (<Lang>, pid <proxy pid>) joined manager pid <pid>`.
+  (<Lang>, pid <proxy pid>) joined manager pid <pid>`. Each stop names its
+  pid, its last measured memory and why it stopped (unused, its directory is
+  gone, the cap, the memory limit).
 - These variables in Claude Code's environment (for example `env` in
   `settings.json`) reach the manager when a session starts it:
   - `LSP_KIT_TRACE=1` adds every message to the log.
   - `LSP_KIT_MAX_SERVERS` sets the machine-wide cap (10).
+  - `LSP_KIT_MAX_MEMORY_MB` sets the machine-wide memory limit in MB (12288).
   - `LSP_KIT_IDLE_MS` sets the idle stop (10 minutes; the tests shorten it).
   - `LSP_KIT_PIPE` names a private manager; the tests give each run its own.
 
@@ -282,6 +339,14 @@ started with, and with it its manager.
   flight). The session's server stops when idle (one server per checkout
   however a request spells it), and a manager left alone exits. A server
   that can't start answers with the reason.
+- `node test/memory.mjs <scratchDir>` sets a 1 MB limit. It checks that the
+  least recently used idle Lua server stops first, then the next. A stub
+  server with a request in flight never stops, and the limit is exceeded and
+  logged. A real server's measured memory is above zero and below the
+  machine's. Then it kills the stub's manager: the stub's helper process
+  (and the stub, off Windows) outlives it. The next manager's start stops
+  them and logs it. A look-alike lsp-kit didn't start, the same program also
+  without a live parent, keeps running.
 - `node test/typescript.mjs <scratchDir>` installs TypeScript 7 into its
   project (npm, so the first run needs the registry or npm's cache). It checks
   definitions and references across two `.ts` files and an `.mjs` file
