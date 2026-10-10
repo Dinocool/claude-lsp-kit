@@ -208,9 +208,10 @@ function saveRecord() {
 // has the record's id. A manager restarted on the same pipe answers with its
 // own id, so its predecessor's record is swept. Of two managers that raced
 // past a stale Unix socket, only the one whose socket file the path names
-// answers; the other's record is swept, and its sessions reconnect to the one
-// answering (as they would on its exit). A pipe that doesn't exist is gone; one that doesn't answer in PROBE_MS, or answers
-// nothing, isn't known gone.
+// answers; the other's record is swept and its servers stopped, while its
+// sessions stay connected to it and it restarts their servers on their next
+// request. A pipe that doesn't exist is gone; one that doesn't answer in
+// PROBE_MS, or closes without answering, isn't known gone.
 const PROBE_MS = 5000;
 const gone = (rec) =>
 	new Promise((resolve) => {
@@ -220,7 +221,9 @@ const gone = (rec) =>
 		probe.once('connect', () => probe.write(frame({ jsonrpc: '2.0', id: 1, method: RECORD_ID })));
 		probe.once('error', (e) => done(e.code === 'ENOENT' || e.code === 'ECONNREFUSED'));
 		probe.once('close', () => done(false));
-		readFrames(probe, (msg) => done(msg.result?.id !== rec.id));
+		// A pipe has one listener, so any frame but the answer to this probe (an
+		// older manager's rejection, say) comes from a manager that isn't the record's.
+		readFrames(probe, (msg) => done(msg.id !== 1 || msg.result?.id !== rec.id));
 	});
 
 // The process list is read after every pipe check, so a slow probe can't leave
