@@ -1,9 +1,10 @@
 // The languages lsp-kit serves; `results` holds per-method response rewrites.
-import { execFileSync, execSync } from 'node:child_process';
+import { exec, execFileSync, execSync } from 'node:child_process';
 import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
 import { delimiter, dirname, join } from 'node:path';
+import { promisify } from 'node:util';
 import { dataDir } from './rpc.mjs';
 
 const SVELTE_CONFIGS = ['svelte.config.js', 'svelte.config.mjs', 'svelte.config.cjs', 'svelte.config.ts'];
@@ -141,23 +142,27 @@ const resolveFrom = (dirs, request) => {
 // still in npm 11.9. It is preferred over re-implementing npmrc resolution or
 // loading npm's bundled @npmcli/config. The folder under the prefix is the npm
 // folders docs' rule. A folder that doesn't exist is a failed lookup.
-// The manager asks once at its start (askNpm). Asking takes about a second, too
-// slow for every Grep hook, so the hooks reuse the manager's last good answer
-// from a file, kept for one key: what npm derives it from (the node binary, the
-// prefix setting and the user's .npmrc).
+// The manager asks once at its start (askNpm) without waiting: the lookup takes
+// seconds at times, and a start blocked that long stopped the manager idle
+// before it accepted the session that started it (see its reap). Asking is too
+// slow for every Grep hook too, so globalModules reuses the manager's last good
+// answer from a file, kept for one key: what npm derives it from (the node
+// binary, the prefix setting and the user's .npmrc); without one it asks npm,
+// synchronously.
 let npmGlobal; // { dir } or { error }
 const npmKey = () => {
 	const userConfig = process.env.npm_config_userconfig || join(homedir(), '.npmrc');
 	return [process.execPath, process.env.npm_config_prefix ?? '', statSync(userConfig, { throwIfNoEntry: false })?.mtimeMs ?? 0].join('|');
 };
 const npmCache = () => join(dataDir(), 'lsp-kit-npm-root.json');
+const NPM_PREFIX = 'npm exec --call "node -p process.env.npm_config_global_prefix"';
+// windowsHide: run from the console-less manager, it would flash a console window.
+const NPM_OPTIONS = { encoding: 'utf8', windowsHide: true };
 
-export function askNpm() {
-	let prefix = '';
-	try {
-		// windowsHide: run from the console-less manager, it would flash a console window.
-		prefix = execSync('npm exec --call "node -p process.env.npm_config_global_prefix"', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true }).trim();
-	} catch {} // no npm: the answer is empty
+export const askNpm = () => promisify(exec)(NPM_PREFIX, NPM_OPTIONS).then(({ stdout }) => settleNpm(stdout), () => settleNpm('')); // no npm: the answer is empty
+
+function settleNpm(answer) {
+	const prefix = answer.trim();
 	const dir = prefix && join(prefix, process.platform === 'win32' ? '' : 'lib', 'node_modules');
 	if (!dir || !existsSync(dir)) return (npmGlobal = { error: `npm's global folder ${dir ? `${dir} doesn't exist` : 'is unknown (npm gave no answer)'}` });
 	try {
@@ -168,14 +173,17 @@ export function askNpm() {
 }
 
 function globalModules() {
-	if (!npmGlobal) {
-		let cached;
-		try {
-			cached = JSON.parse(readFileSync(npmCache(), 'utf8'));
-		} catch {} // none yet
-		npmGlobal = cached?.key === npmKey() && existsSync(cached.dir) ? { dir: cached.dir } : askNpm();
-	}
-	return npmGlobal;
+	if (npmGlobal) return npmGlobal;
+	let cached;
+	try {
+		cached = JSON.parse(readFileSync(npmCache(), 'utf8'));
+	} catch {} // none yet
+	if (cached?.key === npmKey() && existsSync(cached.dir)) return (npmGlobal = { dir: cached.dir });
+	let prefix = '';
+	try {
+		prefix = execSync(NPM_PREFIX, { ...NPM_OPTIONS, stdio: ['ignore', 'pipe', 'ignore'] });
+	} catch {} // no npm: the answer is empty
+	return settleNpm(prefix);
 }
 
 const svelteServer = (root) => resolveFrom([root], 'svelte-language-server/bin/server.js') ?? resolveFrom([globalModules().dir], 'svelte-language-server/bin/server.js');

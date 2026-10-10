@@ -141,9 +141,9 @@ listener.listen(PIPE, () => {
 		renameSync(LOG, LOG.replace(/\.log$/, '.previous.log'));
 	} catch {} // no earlier log
 	log(`manager pid ${process.pid} on ${PIPE} (cap ${MAX_SERVERS} servers, memory limit ${size(MAX_MEMORY)}, idle stop ${IDLE_MS / 1000} s)`);
-	const npm = askNpm();
-	log(npm.dir ? `npm's global folder: ${npm.dir}` : npm.error);
+	askNpm().then((npm) => log(npm.dir ? `npm's global folder: ${npm.dir}` : npm.error));
 	sweep().catch((e) => log(`leftover servers not swept: ${e.message}`));
+	setInterval(reap, Math.min(IDLE_MS, 60 * 1000));
 });
 
 // ---- leftover servers -----------------------------------------------------------
@@ -457,15 +457,29 @@ function measure() {
 	);
 }
 
-setInterval(() => {
+// The idle check runs from the manager's start (listening) on and counts every
+// connection the server has accepted, not only sessions. The net docs give no
+// timing for 'connection' ("emitted when a new connection is made"); it is an
+// I/O callback of the event loop's poll phase, and since Node 20 (libuv 1.45)
+// timers run after the poll phase in each iteration, and once before the loop
+// starts (https://nodejs.org/en/learn/asynchronous-work/event-loop-timers-and-nexttick).
+// So a check that fell due while the start blocked the loop runs before the
+// proxy that started the manager is accepted (that proxy's requests failed),
+// and a check can fall between a proxy's connection and its hello (the message
+// that makes it a session). server.close keeps accepted connections, so that
+// proxy was served by a manager no longer listening, whose open pipe instance
+// on Windows kept a new manager from listening: the next sessions found none.
+// getConnections counts accepted sockets until they close
+// (https://nodejs.org/api/net.html#servergetconnectionscallback).
+function reap() {
 	for (const s of servers.values()) {
 		if (!existsSync(s.root)) stopServer(s, 'its directory is gone');
 		else if (!busy(s) && Date.now() - s.lastUsed > IDLE_MS) stopServer(s, `unused for ${IDLE_MS / 1000} s`);
 	}
 	measure();
 	// Unlisten first: a proxy that connects from now on starts a new manager.
-	if (!sessions.size && !running.size) listener.close(() => process.exit(0));
-}, Math.min(IDLE_MS, 60 * 1000));
+	listener.getConnections((e, connections) => connections === 0 && !running.size && listener.close(() => process.exit(0)));
+}
 
 // One key per checkout, however a client spells it (drive-letter case, 8.3
 // short names, subst drives, junctions, symlinks): realpathSync.native is the

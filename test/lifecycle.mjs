@@ -4,12 +4,16 @@
 // the manager takes every server with it; the machine-wide cap stops the least
 // recently used server across sessions, never one with a request in flight;
 // the session root's server stops when idle and restarts on demand, and a
-// manager left with no session and no server exits.
+// manager left with no session, connection or server exits, never before it
+// has accepted the session that started it, however slow its npm lookup.
 // Usage: node test/lifecycle.mjs <scratchDir>   (needs lua-language-server and git)
 import { execSync } from 'node:child_process';
+import { once } from 'node:events';
 import { existsSync, mkdirSync, realpathSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { connect } from 'node:net';
+import { delimiter, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { dataDir, pipePath } from '../plugins/lsp-kit/rpc.mjs';
 import { alive, check, consoleWindow, finish, killManager, log, privatePipe, scratch, startProxy, wait } from './client.mjs';
 
 const base = process.argv[2];
@@ -105,9 +109,20 @@ check(one.stderr.some((l) => /every live server has a request in flight: 2 excee
 await one.close();
 
 // ---- idle stop of the session root's server, manager exit ---------------------
-const b = startProxy('lua', repo, { LSP_KIT_IDLE_MS: '3000' });
-await b.initialize(repo);
+// Its manager's npm lookup answers after the idle period (an `npm` first on its
+// PATH that answers nothing in 5 s): the manager still serves the session that
+// started it and stops idle only once that session is gone.
+const slowNpm = join(base, 'slow-npm');
+mkdirSync(slowNpm);
+writeFileSync(join(slowNpm, 'npm.cmd'), '@node -e "setTimeout(() => {}, 5000)"\r\n');
+writeFileSync(join(slowNpm, 'npm'), '#!/bin/sh\nsleep 5\n', { mode: 0o755 });
+const pathKey = Object.keys(process.env).find((k) => k.toUpperCase() === 'PATH');
+const b = startProxy('lua', repo, { LSP_KIT_IDLE_MS: '3000', [pathKey]: `${slowNpm}${delimiter}${process.env[pathKey]}` });
+const bInit = await b.initialize(repo);
+check(!bInit?.error, `the session's manager answers initialize while its npm lookup is slow (${bInit?.error ?? 'ok'})`);
 check((await refs(b, repo)) === '3 refs', 'main checkout answers (3 s idle stop)');
+check(await until(() => b.stderr.some((l) => l.includes("npm's global folder is unknown")), 10000), 'the npm lookup answered after the session joined');
+check(b.stderr.filter((l) => / joined manager pid /.test(l)).length === 1, 'one manager served the session throughout');
 const idleStop = async () => {
 	const pid = b.pidFor(repo);
 	const stopped = await until(() => b.stderr.some((l) => l.includes(`stopping Lua server #${starts(b).length} for ${repo}`)) && !alive(pid), 15000);
@@ -145,6 +160,24 @@ await b.exited;
 log('stdin ended: proxy exited');
 const gone = await until(() => ![...bPids, bManager].some(alive), 20000);
 check(gone, `with no session left, the servers stop when idle and the manager exits (${[...bPids, bManager].join(', ')})`);
+
+// A connection whose hello hasn't come yet keeps the manager up, listening, as
+// a session does: the next session joins it.
+const dEnv = { LSP_KIT_PIPE: privatePipe(), LSP_KIT_IDLE_MS: '2000' };
+const d = startProxy('lua', repo, dEnv);
+await d.initialize(repo);
+await until(() => d.manager, 5000);
+const silent = connect(pipePath(dEnv.LSP_KIT_PIPE, dataDir()));
+await once(silent, 'connect');
+await d.close();
+await wait(10000); // past the 2 s idle stop of the session's server and the manager's next checks
+const e = startProxy('lua', repo, { ...dEnv, name: 'e' });
+const eInit = await e.initialize(repo);
+await until(() => e.manager, 5000);
+check(!eInit?.error && e.manager === d.manager, `with a connection that has sent no hello, the next session joins the same manager (pid ${d.manager}, joined ${e.manager}, ${eInit?.error ?? 'ok'})`);
+await e.close();
+silent.destroy();
+check(await until(() => !alive(d.manager), 10000), 'the manager exits once that connection closes');
 
 // ---- a server that can't start ------------------------------------------------
 const c = startProxy('lua', repo, { PATH: '' });

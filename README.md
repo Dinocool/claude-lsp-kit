@@ -97,7 +97,8 @@ junctions); each session only ever sees its own spelling.
   for its checkout.
 - When a session ends, its documents are released; its servers stay for
   the other sessions until they idle out. The manager exits once it has
-  neither sessions nor servers.
+  no connection (a session, or a proxy that hasn't said hello yet) and no
+  server.
 - If the manager dies, its servers die with it, requests in flight fail with
   that reason, and each session's next request starts a new manager. If the
   manager can't be started or reached, every request fails with the reason.
@@ -207,10 +208,10 @@ checkout, pids and the gone manager.
     back as a folder that doesn't exist.
   - An answer whose folder doesn't exist is a failed lookup, and a server
     that needed the folder names npm's answer in its start error.
-  - The manager asks once at its start and logs the answer. The hooks reuse
-    its last good answer from `lsp-kit-npm-root.json` in the plugin data
-    directory. That file keeps one key: the node binary, the prefix setting
-    and `~/.npmrc`.
+  - The manager asks once at its start, without waiting, and logs the
+    answer. The hooks reuse its last good answer from `lsp-kit-npm-root.json`
+    in the plugin data directory. That file keeps one key: the node binary,
+    the prefix setting and `~/.npmrc`.
 - **TypeScript and JavaScript:** one TypeScript 7 server per checkout serves
   every `.ts`/`.js` flavour. TypeScript 7 (July 2026) is the native port and
   ships its own LSP server; Microsoft's
@@ -259,7 +260,6 @@ checkout, pids and the gone manager.
     loser hangs or exits with "Duplicate channel 'task:1'". In a trial, 17 of
     120 servers started together exited that way. With a folder each, none
     did. Two checkouts whose Lua servers start together are enough to hit it.
-
 If a server isn't installed, `initialize` and each later request fail with a
 message that names it.
 
@@ -418,8 +418,10 @@ started with, and with it its manager.
   killing the manager stops every server, and the machine-wide cap across
   two sessions (least recently used first, never one with a request in
   flight). The session's server stops when idle (one server per checkout
-  however a request spells it), and a manager left alone exits. A server
-  that can't start answers with the reason.
+  however a request spells it), and a manager left alone exits, never
+  before it has accepted the session that started it (its npm lookup made
+  slower than the idle stop) and never while a connection that hasn't said
+  hello is open. A server that can't start answers with the reason.
 - `node test/memory.mjs <scratchDir>` sets a 1 MB limit. It checks that the
   least recently used idle Lua server stops first, then the next. A stub
   server with a request in flight never stops, and the limit is exceeded and
