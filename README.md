@@ -58,10 +58,20 @@ junctions); each session only ever sees its own spelling.
   document, the server reloads it from disk.
 - Diagnostics go to every session with the document open. Claude Code's
   client only takes pushed diagnostics (`textDocument/publishDiagnostics`).
-  A server that advertises pull diagnostics (LSP 3.17 `diagnosticProvider`;
-  TypeScript 7 serves no others) is asked with `textDocument/diagnostic`
-  after every open or change and on its `workspace/diagnostic/refresh`. Its
-  report reaches the sessions as a push.
+  So when a server advertises pull diagnostics (LSP 3.17
+  `diagnosticProvider`), lsp-kit asks it for each open document with
+  `textDocument/diagnostic`. It asks after every open or change and on the
+  server's `workspace/diagnostic/refresh`, and passes each answer on as a
+  push. TypeScript 7 serves only pulled diagnostics.
+  - A document's pulled set joins its pushed set; it doesn't replace it. That
+    matters for rust-analyzer, whose pushed cargo-check errors aren't in its
+    pulled set.
+  - One pull per document is in flight. A change cancels the older pull and
+    ignores its late answer, so a slow answer for an old version never
+    overwrites the current one.
+  - A server that advertises pulls but answers MethodNotFound
+    (svelte-language-server) is no longer asked; the log says so once.
+  - Pulls don't count as use, so a server still stops when idle.
 - `workspaceSymbol` asks the session checkout's server (starting it if it
   stopped) and every other running server the session has used, and merges
   the results.
@@ -113,7 +123,11 @@ junctions); each session only ever sees its own spelling.
   `rust-toolchain.toml` applies): rustup's own `rust-analyzer` is a proxy
   that runs the real server as its child, which stopping it could orphan.
 - **Svelte:** the server comes from the project's `node_modules` if it's
-  there, otherwise from the global install next to `node`.
+  there, otherwise from npm's global folder. lsp-kit asks npm where that is
+  ([`npm root -g`](https://docs.npmjs.com/cli/commands/npm-root)), which covers
+  the Windows installer's `%AppData%\npm`, a custom prefix and version
+  managers. It keeps the answer in `lsp-kit-npm-root.json` in the plugin data
+  directory, keyed by the node binary, the prefix setting and `~/.npmrc`.
 - **TypeScript and JavaScript:** one TypeScript 7 server per checkout serves
   every `.ts`/`.js` flavour. TypeScript 7 (July 2026) is the native port and
   ships its own LSP server; Microsoft's
@@ -123,12 +137,18 @@ junctions); each session only ever sees its own spelling.
   [typescript-language-server](https://github.com/typescript-language-server/typescript-language-server),
   whose README expects TypeScript 7 to supersede it, and
   [vtsls](https://github.com/yioneko/vtsls), last released December 2025 and
-  self-described as best-effort. The server is the first TypeScript 7 or newer
-  found in the project's `node_modules`, then in the global install next to
-  `node`. A project still on TypeScript 6 (Svelte's tooling needs it) is
-  served by the global one. lsp-kit starts the native binary from
+  self-described as best-effort. The server is the first TypeScript 7 or
+  newer among the project's `typescript`, then its `@typescript/native` (the
+  announcement's side-by-side alias of `typescript@7`), then npm's global
+  `typescript`. lsp-kit starts the native binary from
   `@typescript/typescript-<platform>-<arch>` directly, because the `tsc` bin
   is a node wrapper that runs it as a child.
+  - **TypeScript 6 projects** (Svelte's tooling still needs 6) are served by
+    TypeScript 7, with TypeScript 7's semantics. A tsconfig option TypeScript
+    7 removed (`baseUrl`, say, even with `ignoreDeprecations`) is a hard error
+    there and does nothing, so definitions through it come back empty. The
+    log names the project's version next to the server's, and TypeScript 7's
+    tsconfig errors reach the session as diagnostics on `tsconfig.json`.
   - **Boundary with Svelte:** `.svelte` files stay with the Svelte server,
     and TypeScript 7 can't see inside them (that needs a tsserver plugin). So
     `findReferences` from a `.ts` symbol misses its uses in `.svelte` files,
@@ -231,7 +251,7 @@ started with, and with it its manager.
 - Each test below builds a throwaway project under `<scratchDir>`, runs its
   own private managers, and prints PASS/FAIL lines:
 - `node test/hooks.mjs <scratchDir>` checks what the hooks add, with a
-  stub TypeScript 6 (not served) and then 7.
+  stub TypeScript 6 (not served) and then 7, and an empty npm global folder.
 - `node test/shared.mjs <scratchDir>` checks two sessions on one checkout
   share one server and each sees its own spelling of it. It checks documents
   stay open until the last session closes them or its proxy is killed, and
@@ -252,11 +272,23 @@ started with, and with it its manager.
   definitions and references across two `.ts` files and an `.mjs` file
   importing one, that two sessions share one server, and that the manager runs
   the native binary itself. It also checks that pulled diagnostics reach the
-  session as pushes (after an open, and on refresh for other open files), and
-  that the TypeScript server counts toward the cap with a Lua server.
+  session as pushes (after an open, and on refresh for other open files),
+  that after two quick edits the last published set is always the last
+  text's (20 runs), and that the TypeScript server counts toward the cap
+  with a Lua server. A TypeScript 6 project with `@typescript/native` gets
+  TypeScript 7, the log names both versions, and its removed `baseUrl`
+  reaches the session as a tsconfig diagnostic. A TypeScript 7 without its
+  platform package fails with that package's name. npm's global folder is
+  an empty one of its own.
 - `node test/rust.mjs <scratchDir>` checks the manager holds rust-analyzer
   itself, a worktree pinned to another installed toolchain gets that
-  toolchain's server, and every server exits with the manager.
+  toolchain's server, and every server exits with the manager. A borrow
+  error only cargo check finds stays published after an edit (pushed and
+  pulled sets are joined), and a server whose files keep changing on disk
+  still stops when idle (refresh pulls aren't use).
+- `node test/svelte.mjs <scratchDir>` checks svelte-language-server, which
+  advertises pull diagnostics but answers MethodNotFound, gets one pull and
+  one log line however many changes follow.
 - `node test/roots.mjs <scratchDir>` checks a session started in a
   subdirectory roots Lua at the git toplevel (`.luarc.json` applies), a
   sibling worktree gets its own server, and the Lua outline.

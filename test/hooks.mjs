@@ -12,6 +12,10 @@ import { check, finish } from './client.mjs';
 const root = join(process.argv[2], 'project');
 rmSync(process.argv[2], { recursive: true, force: true });
 mkdirSync(root, { recursive: true });
+// An empty npm global folder (npm's prefix setting), so a global TypeScript 7 on
+// this machine doesn't count.
+const env = { ...process.env, npm_config_prefix: join(process.argv[2], 'empty-prefix') };
+mkdirSync(env.npm_config_prefix);
 writeFileSync(join(root, '.luarc.json'), '{}');
 writeFileSync(join(root, 'big.lua'), 'local x = 1\n'.repeat(200));
 writeFileSync(join(root, 'x.mjs'), 'export const helper = 1;\n');
@@ -27,7 +31,7 @@ const typescript = (version) => {
 
 const hook = fileURLToPath(new URL('../plugins/lsp-kit/hooks/nudge.mjs', import.meta.url));
 const run = (event, extra) => {
-	const out = execFileSync(process.execPath, [hook], { input: JSON.stringify({ hook_event_name: event, cwd: root, ...extra }) }).toString();
+	const out = execFileSync(process.execPath, [hook], { env, input: JSON.stringify({ hook_event_name: event, cwd: root, ...extra }) }).toString();
 	const context = out ? JSON.parse(out).hookSpecificOutput.additionalContext : null;
 	console.log(`${event} ${JSON.stringify(extra.tool_input ?? extra)}\n   ${context ?? '-'}`);
 	return context;
@@ -36,7 +40,7 @@ const grep = (input) => run('PreToolUse', { tool_name: 'Grep', tool_input: input
 const read = (input) => run('PreToolUse', { tool_name: 'Read', tool_input: input });
 const DEFERRED = 'The LSP tool is deferred: load it once with ToolSearch query "select:LSP" before your first code lookup.';
 const HINT = '"helper" is a symbol. For the next lookup use LSP (ToolSearch "select:LSP" if not loaded): workspaceSymbol query "helper" finds its definition; findReferences at that line lists every usage.';
-const TS_NOTE = 'TypeScript and JavaScript (.ts, .mts, .cts, .tsx, .js, .mjs, .cjs, .jsx; TypeScript 7;';
+const TS_NOTE = 'TypeScript and JavaScript (.ts, .mts, .cts, .tsx, .js, .mjs, .cjs, .jsx; TypeScript 7, also for a TypeScript 6 project (TypeScript 7 semantics: a tsconfig option it removed';
 
 // TypeScript 6 has no LSP server: Lua alone is served.
 typescript('6.0.3');

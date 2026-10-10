@@ -74,6 +74,8 @@ const STDERR_LINE = 300; // a server's stderr line is logged up to this many cha
 const WATCHED_FILES = 'workspace/didChangeWatchedFiles';
 const FILE_CHANGE = { Created: 1, Changed: 2, Deleted: 3 };
 const CONTENT_MODIFIED = -32801;
+const SERVER_CANCELLED = -32802;
+const METHOD_NOT_FOUND = -32601;
 const RETRY_MS = 500;
 const RETRY_WINDOW_MS = 55 * 1000; // under Claude Code's 60 s request timeout
 const DID_OPEN = 'textDocument/didOpen';
@@ -138,8 +140,11 @@ function startServer(session, root, key, shareKey) {
 	const server = { lang, root, key, shareKey, no: ++serverCount, docs: new Map(), requests: new Set(), lastUsed: Date.now(), waiting: new Map(), queue: [], ready: false };
 	servers.set(shareKey, server);
 	running.add(server);
+	let note;
 	try {
-		const { command, args } = lang.server(root);
+		const start = lang.server(root);
+		note = start.note;
+		const { command, args } = start;
 		// cwd stays the manager's (the home directory): on Windows a process's cwd
 		// can't be deleted, which would block removing the worktree. Servers take
 		// their root from rootUri. windowsHide: the manager has no console, so
@@ -164,6 +169,7 @@ function startServer(session, root, key, shareKey) {
 		setImmediate(() => serverClosed(server));
 	}
 	log(`${lang.name} server #${server.no} for ${root} (${servers.size} live, pid ${server.child?.pid})`);
+	if (note) log(`${lang.name} server #${server.no}: ${note}`);
 
 	const uri = pathToFileURL(root).href;
 	const params = structuredClone(session.init ?? {});
@@ -174,11 +180,11 @@ function startServer(session, root, key, shareKey) {
 	params.capabilities ??= {};
 	params.capabilities.workspace ??= {};
 	params.capabilities.workspace.didChangeWatchedFiles = { dynamicRegistration: true };
-	params.capabilities.workspace.diagnostics = { refreshSupport: true }; // see sendDoc
+	params.capabilities.workspace.diagnostics = { refreshSupport: true }; // see pullDiagnostics
 	params.initializationOptions = { ...lang.initializationOptions?.(root), ...params.initializationOptions };
 	server.initialized = request(server, 'initialize', params, true).then((result) => {
 		if (server.closed) return;
-		server.pullsDiagnostics = !!result?.capabilities?.diagnosticProvider; // see sendDoc
+		server.pullsDiagnostics = !!result?.capabilities?.diagnosticProvider; // see pullDiagnostics
 		write(server, { jsonrpc: '2.0', method: 'initialized', params: {} });
 		server.ready = true;
 		for (const msg of server.queue.splice(0)) write(server, msg);
@@ -218,8 +224,9 @@ function write(server, msg) {
 }
 
 // Sends to a server once it is initialized (`initialize` itself goes out at once).
-function send(server, msg) {
-	server.lastUsed = Date.now();
+// `used`: whether it counts as use for the idle stop and the cap.
+function send(server, msg, used = true) {
+	if (used) server.lastUsed = Date.now();
 	if (server.ready) write(server, msg);
 	else server.queue.push(msg);
 }
@@ -229,7 +236,7 @@ function request(server, method, params, now = false) {
 	const msg = { jsonrpc: '2.0', id, method, params };
 	if (now) write(server, msg);
 	else send(server, msg);
-	return new Promise((resolve) => server.waiting.set(id, resolve));
+	return new Promise((resolve) => server.waiting.set(id, (reply) => resolve(reply?.result)));
 }
 
 // LSP 3.17: `shutdown`, then `exit` once it is answered. One still running
@@ -462,21 +469,61 @@ function syncFromDisk(server, key, uri, version, session) {
 	sendDoc(server, { jsonrpc: '2.0', method: DID_CHANGE, params: { textDocument: { uri: doc.uri, version: ++doc.version }, contentChanges: [{ text }] } });
 }
 
-// A didOpen or didChange to the server, then its diagnostics pulled if it
-// serves them that way. LSP 3.17 "Pull Diagnostics": a server advertising
-// `diagnosticProvider` may answer only `textDocument/diagnostic` (TypeScript 7
-// does), but Claude Code's client takes only pushed `publishDiagnostics`. The
-// manager pulls after each change it sends and on `workspace/diagnostic/refresh`,
-// and passes the report on as a push.
+// A didOpen or didChange to the server, then the document's diagnostics pulled.
 function sendDoc(server, msg) {
 	send(server, msg);
-	server.initialized.then(() => pullDiagnostics(server, docUri(msg.params)));
+	const key = docKey(docUri(msg.params));
+	server.initialized.then(() => pullDiagnostics(server, key));
 }
-function pullDiagnostics(server, uri) {
-	if (!server.pullsDiagnostics) return;
-	request(server, 'textDocument/diagnostic', { textDocument: { uri } }).then((report) => {
-		if (report?.kind === 'full' && server.docs.has(docKey(uri))) fromServer(server, { jsonrpc: '2.0', method: PUBLISH, params: { uri, diagnostics: report.items } });
+
+// LSP 3.17 "Pull Diagnostics" (textDocument_pullDiagnostics): a server whose
+// initialize result advertises `diagnosticProvider` may answer only
+// `textDocument/diagnostic` (TypeScript 7 does), but Claude Code's client takes
+// only pushed `publishDiagnostics`. So the manager pulls each open document
+// after every change it sends and on `workspace/diagnostic/refresh`, and pushes
+// the report on.
+// - The pulled set doesn't replace the pushed one. The spec defines no such
+//   replacement, and its DiagnosticOptions.identifier names a separate set
+//   "managed by the client". rust-analyzer pushes its cargo-check errors
+//   (borrow errors among them) and answers pulls with its own analysis. A
+//   document's last pushed and last pulled sets are kept apart and published as
+//   their union.
+// - One pull per document is in flight. A change supersedes it: the request is
+//   cancelled and its late answer ignored, because TypeScript 7 answers
+//   concurrent pulls out of order. A refresh during a pull pulls once more after it.
+// - `ServerCancelled` re-pulls unless its data says not to (the spec's default
+//   is `retriggerRequest: true`). MethodNotFound (svelte-language-server
+//   advertises pulls it doesn't answer) ends pulling from that server, even
+//   when it answers a superseded pull.
+// - Pulls never count as use, so a server whose refreshes follow file churn
+//   still stops when idle.
+function pullDiagnostics(server, key, refresh = false) {
+	const doc = server.docs.get(key);
+	if (!server.pullsDiagnostics || server.stopped || !doc) return;
+	if (doc.pulling && refresh) return void (doc.repull = true);
+	if (doc.pulling) write(server, { jsonrpc: '2.0', method: '$/cancelRequest', params: { id: doc.pulling } });
+	const id = (doc.pulling = `kit:${++ids}`);
+	doc.repull = false;
+	server.waiting.set(id, (reply) => {
+		if (reply?.error?.code === METHOD_NOT_FOUND && server.pullsDiagnostics) {
+			server.pullsDiagnostics = false;
+			return log(`${server.lang.name} server #${server.no} advertises pull diagnostics but doesn't answer them: no more pulls`);
+		}
+		if (!reply || server.docs.get(key) !== doc || doc.pulling !== id) return; // server gone, document closed, or superseded
+		doc.pulling = null;
+		const { error, result } = reply;
+		if (error?.code === SERVER_CANCELLED && error.data?.retriggerRequest !== false) return void setTimeout(() => pullDiagnostics(server, key, true), RETRY_MS);
+		if (result?.kind === 'full') publishDoc(server, doc, { pulled: result.items });
+		if (doc.repull) pullDiagnostics(server, key);
 	});
+	send(server, { jsonrpc: '2.0', id, method: 'textDocument/diagnostic', params: { textDocument: { uri: doc.uri } } }, false);
+}
+
+// The document's pushed or pulled set replaced; their union goes to its holders.
+function publishDoc(server, doc, sets) {
+	Object.assign(doc, sets);
+	const params = { uri: doc.uri, diagnostics: [...(doc.pushed ?? []), ...(doc.pulled ?? [])] };
+	for (const s of doc.holders) toSession(s, respellAll({ jsonrpc: '2.0', method: PUBLISH, params }, server.root, s.uses.get(server) ?? server.root));
 }
 
 // The session no longer holds the document; the last holder's close reaches the server.
@@ -517,7 +564,7 @@ function settle(entry, reply) {
 const SERVER_REQUESTS = {
 	'workspace/configuration': (params) => params.items.map(() => null), // one null per item: "can't provide"
 	'workspace/workspaceFolders': (params, server) => [{ uri: pathToFileURL(server.root).href, name: server.root.split(sep).pop() }],
-	'workspace/diagnostic/refresh': (params, server) => void [...server.docs.values()].forEach((doc) => pullDiagnostics(server, doc.uri))
+	'workspace/diagnostic/refresh': (params, server) => void [...server.docs.keys()].forEach((key) => pullDiagnostics(server, key, true))
 };
 
 function fromServer(server, msg) {
@@ -526,7 +573,7 @@ function fromServer(server, msg) {
 		const resolve = server.waiting.get(msg.id);
 		if (resolve) {
 			server.waiting.delete(msg.id);
-			resolve(msg.result);
+			resolve(msg);
 			return;
 		}
 		const entry = pending.get(msg.id);
@@ -549,8 +596,8 @@ function fromServer(server, msg) {
 	// Progress tokens are the manager's (it answered window/workDoneProgress/create).
 	if (msg.method === '$/progress') return;
 	const doc = msg.method === PUBLISH && server.docs.get(docKey(msg.params.uri));
-	const to = doc ? doc.holders : [...sessions].filter((s) => s.uses.has(server));
-	for (const s of to) toSession(s, respellAll(msg, server.root, s.uses.get(server) ?? server.root));
+	if (doc) return publishDoc(server, doc, { pushed: msg.params.diagnostics });
+	for (const s of [...sessions].filter((s) => s.uses.has(server))) toSession(s, respellAll(msg, server.root, s.uses.get(server) ?? server.root));
 }
 
 // ---- file watching ------------------------------------------------------------
