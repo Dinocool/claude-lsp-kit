@@ -1,15 +1,15 @@
 {
-	"name": "claude-svelte-lsp",
+	"name": "claude-lsp-kit",
 	"owner": { "name": "Dinocool", "url": "https://github.com/Dinocool" },
 	"metadata": {
-		"description": "Svelte language server for Claude Code that stays responsive in large workspaces."
+		"description": "Svelte, Rust and Lua language servers for Claude Code that stay responsive in large repos and follow agents into git worktrees."
 	},
 	"plugins": [
 		{
-			"name": "svelte-lsp",
-			"source": "./plugins/svelte-lsp",
-			"description": "svelte-language-server with a native file watcher instead of its whole-workspace chokidar fallback, plus hooks that steer Claude to LSP navigation.",
-			"version": "1.1.0",
+			"name": "lsp-kit",
+			"source": "./plugins/lsp-kit",
+			"description": "Svelte, Rust and Lua LSP behind one proxy: native file watching, a bounded server per git worktree, nested Cargo crates linked; hooks advertise the LSP and steer symbol work to it.",
+			"version": "2.0.0",
 			"category": "development"
 		}
 	]
