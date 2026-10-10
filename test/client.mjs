@@ -32,6 +32,7 @@ export function startProxy(language, cwd, env = {}) {
 	const waits = new Map();
 	const client = { proxy, stderr: [], onNotification: () => {} };
 	client.exited = new Promise((res) => proxy.on('exit', res));
+	client.exited.then((code) => waits.forEach((res) => res({ error: `proxy exited (code ${code})` })));
 	proxy.stderr.on('data', (d) => d.toString().split('\n').filter((l) => l.startsWith('lsp-kit')).forEach((l) => (client.stderr.push(l), log(l))));
 	client.write = (m) => {
 		const b = Buffer.from(JSON.stringify(m));
@@ -39,7 +40,10 @@ export function startProxy(language, cwd, env = {}) {
 	};
 	client.notify = (method, params) => client.write({ jsonrpc: '2.0', method, params });
 	let id = 0;
-	client.req = (method, params) => new Promise((res) => (waits.set(++id, res), client.write({ jsonrpc: '2.0', id, method, params })));
+	client.req = (method, params) =>
+		proxy.exitCode !== null
+			? Promise.resolve({ error: `proxy exited (code ${proxy.exitCode})` })
+			: new Promise((res) => (waits.set(++id, res), client.write({ jsonrpc: '2.0', id, method, params })));
 	let buf = Buffer.alloc(0);
 	proxy.stdout.on('data', (d) => {
 		buf = Buffer.concat([buf, d]);

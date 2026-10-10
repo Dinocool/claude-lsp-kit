@@ -28,12 +28,11 @@
 // once (least recently used stops first); each stops after IDLE_MS unused or
 // once its directory is gone. A server that exits, crashes or is stopped is
 // dropped, and the next request for its root starts a fresh one (LSP 3.17:
-// the client owns the server lifecycle, and `initialize` goes once per
-// process). The proxy itself exits only on the client's `exit` or the end of
-// its stdin, taking every server it started with it: Claude Code does not
-// restart a proxy that exits cleanly, so one dead server used to take the
-// language down for the rest of the session. Only the session root's first
-// `initialize` result answers the client's `initialize`.
+// the client owns the server lifecycle; `initialize` goes once per process).
+// The proxy exits only on the client's `exit` or the end of its stdin, taking
+// every server it started with it: Claude Code doesn't restart a proxy that
+// exits cleanly. The client's `initialize` gets the session root's first
+// server's result.
 //
 // 4. Per-language setup from languages.mjs (server command, initialization
 //    options such as rust-analyzer's linkedProjects for nested crates, response
@@ -73,7 +72,6 @@ const servers = new Map(); // git root -> server
 const running = new Set(); // every server whose process hasn't closed, stopping ones included
 const pendingClientRequests = new Map(); // client request id -> { server, msg, since }
 let clientInit = null;
-let clientConfig = null; // the last workspace/didChangeConfiguration, replayed to every new server
 let sessionRoot = null;
 let shutdownReceived = false;
 let exiting = false;
@@ -153,7 +151,6 @@ function startServer(root) {
 	server.initialized = request(server, 'initialize', params, true).then((result) => {
 		if (server.closed) return;
 		write(server, { jsonrpc: '2.0', method: 'initialized', params: {} });
-		if (clientConfig) write(server, clientConfig);
 		server.ready = true;
 		for (const msg of server.queue.splice(0)) write(server, msg);
 		watchRoot(server);
@@ -301,10 +298,8 @@ readFrames(process.stdin, (msg) => {
 			Promise.all([...asked].map((s) => request(s, msg.method, msg.params))).then((answers) =>
 				answer(msg.id, home, answers.flatMap((a) => a ?? []))
 			);
-		} else if (msg.method === 'workspace/didChangeConfiguration') {
-			clientConfig = msg; // a server still starting gets it once initialized
-			for (const s of servers.values()) if (s.ready) write(s, msg);
-		} else route(serverFor(sessionRoot), msg);
+		} else if (msg.method === 'workspace/didChangeConfiguration') for (const s of servers.values()) send(s, msg);
+		else route(serverFor(sessionRoot), msg);
 		return;
 	}
 	if (msg.method === 'textDocument/didClose') {

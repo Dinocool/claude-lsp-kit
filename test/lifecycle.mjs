@@ -74,6 +74,16 @@ check((await refs(b, repo)) === '3 refs', 'main checkout answers (3 s idle stop)
 const idlePid = b.pidFor(repo);
 const stopped = await until(() => b.stderr.some((l) => l.includes(`stopping Lua server #1 for ${repo}`)) && !alive(idlePid), 15000);
 check(stopped, `the main checkout's server (pid ${idlePid}) stops when idle`);
+b.notify('textDocument/didClose', { textDocument: { uri: pathToFileURL(join(repo, 'a.lua')).href } });
+await wait(500);
+check(b.pidFor(repo) === idlePid, 'closing a document does not start a stopped server');
+let symbols;
+for (let i = 0; i < 40; i++) {
+	symbols = await b.req('workspace/symbol', { query: 'helper' });
+	if (symbols?.error || symbols?.length) break;
+	await wait(500); // empty while LuaLS loads the workspace
+}
+check(symbols?.some?.((s) => s.name === 'helper'), 'workspaceSymbol starts the stopped server and finds helper');
 check((await refs(b, repo)) === '3 refs' && b.pidFor(repo) !== idlePid, 'the next request restarts it with the same answer');
 
 const bPids = b.pids();
