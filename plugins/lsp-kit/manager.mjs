@@ -157,9 +157,9 @@ listener.listen(PIPE, () => {
 // (at each server start and measurement, until the process is gone), and the
 // next manager to start stops the recorded processes of managers that are
 // gone, with their descendants.
-// - A manager is gone when its pipe doesn't answer (see `gone`). That needs
-//   no clock: a start time read back from `ps` moves with a clock step, and
-//   would make a live manager look gone.
+// - A manager is gone when its pipe doesn't answer with its id (see `gone`).
+//   That needs no clock: a start time read back from `ps` moves with a clock
+//   step, and would make a live manager look gone.
 // - A process is lsp-kit's only by its pid AND creation time, both from one
 //   listing: a process that reused the pid, or one lsp-kit didn't start
 //   (another editor's rust-analyzer), is never touched. A marker in each
@@ -168,7 +168,9 @@ listener.listen(PIPE, () => {
 //   only ImagePathName and CommandLine), and a marker argument breaks servers
 //   that reject unknown ones.
 const RECORDS = `lsp-kit-servers-${userInfo().username}-`;
-const RECORD = join(dir, `${RECORDS}${randomUUID()}.json`);
+const ID = randomUUID();
+const RECORD = join(dir, `${RECORDS}${ID}.json`);
+const RECORD_ID = 'lsp-kit/record-id'; // another manager's liveness probe (see gone), answered with ID
 const owned = new Map(); // pid -> { pid, created, lang, root, server (its server's pid) }, while it lives
 let saved = '';
 
@@ -188,7 +190,7 @@ function record() {
 // A write that fails (Windows refuses a rename while another process reads the
 // file) is retried by the next record, never fatal to the manager.
 function saveRecord() {
-	const text = owned.size ? JSON.stringify({ pipe: PIPE, pid: process.pid, processes: [...owned.values()] }) : '';
+	const text = owned.size ? JSON.stringify({ id: ID, pipe: PIPE, pid: process.pid, processes: [...owned.values()] }) : '';
 	if (text === saved) return;
 	try {
 		if (!text) rmSync(RECORD, { force: true });
@@ -202,16 +204,24 @@ function saveRecord() {
 	}
 }
 
-const answers = (pipe) =>
+// A record's manager runs only if the manager answering on the record's pipe
+// has the record's id. A manager restarted on the same pipe answers with its
+// own id, so its predecessor's record is swept. Of two managers that raced
+// past a stale Unix socket, only the one whose socket file the path names
+// answers; the other's record is swept, and its sessions reconnect to the one
+// answering (as they would on its exit). A pipe that doesn't exist is gone; one that doesn't answer in PROBE_MS, or answers
+// nothing, isn't known gone.
+const PROBE_MS = 5000;
+const gone = (rec) =>
 	new Promise((resolve) => {
-		const probe = connect(pipe);
-		probe.once('connect', () => (probe.destroy(), resolve(true)));
-		probe.once('error', (e) => resolve(e.code !== 'ENOENT' && e.code !== 'ECONNREFUSED')); // anything else: not known gone
+		const probe = connect(rec.pipe);
+		const done = (isGone) => (probe.destroy(), resolve(isGone));
+		probe.setTimeout(PROBE_MS, () => done(false));
+		probe.once('connect', () => probe.write(frame({ jsonrpc: '2.0', id: 1, method: RECORD_ID })));
+		probe.once('error', (e) => done(e.code === 'ENOENT' || e.code === 'ECONNREFUSED'));
+		probe.once('close', () => done(false));
+		readFrames(probe, (msg) => done(msg.result?.id !== rec.id));
 	});
-// A named pipe has one listener, so on Windows a record naming this manager's
-// pipe is a gone predecessor's. A Unix socket path can have two listeners (two
-// managers racing past a stale socket), so there it is probed like any other.
-const gone = async (rec) => (process.platform === 'win32' && rec.pipe === PIPE) || !(await answers(rec.pipe));
 
 // The process list is read after every pipe check, so a slow probe can't leave
 // the kills matching a stale list.
@@ -220,7 +230,7 @@ async function sweep() {
 	for (const file of readdirSync(dir).filter((f) => f.startsWith(RECORDS) && f.endsWith('.json') && join(dir, f) !== RECORD)) {
 		try {
 			const rec = JSON.parse(readFileSync(join(dir, file), 'utf8'));
-			if (typeof rec.pipe !== 'string' || !Array.isArray(rec.processes)) throw new Error('not a server record');
+			if (typeof rec.id !== 'string' || typeof rec.pipe !== 'string' || !Array.isArray(rec.processes)) throw new Error('not a server record');
 			records.push({ file, rec });
 		} catch (e) {
 			log(`server record ${file} unreadable, left in place: ${e.message}`);
@@ -520,6 +530,10 @@ function detach(session) {
 // the client has sent them, so a manager started after that serves the session.
 // Any other first message ends the connection with the reason.
 function hello(session, msg) {
+	if (msg?.method === RECORD_ID) {
+		toSession(session, { jsonrpc: '2.0', id: msg.id, result: { id: ID } });
+		return void session.socket.end();
+	}
 	const { language, cwd, pid, initialize } = (msg?.method === 'lsp-kit/hello' && msg.params) || {};
 	if (!Object.hasOwn(LANGUAGES, language)) {
 		toSession(session, { jsonrpc: '2.0', method: 'lsp-kit/log', params: { line: `lsp-kit: rejected: the first message must be a hello for one of ${Object.keys(LANGUAGES).join(', ')}` } });
