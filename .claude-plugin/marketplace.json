@@ -9,7 +9,7 @@
 			"name": "lsp-kit",
 			"source": "./plugins/lsp-kit",
 			"description": "Svelte, Rust and Lua LSP behind one proxy: native file watching, a bounded server per git worktree, nested Cargo crates linked; hooks advertise the LSP and steer symbol work to it.",
-			"version": "2.0.0",
+			"version": "2.0.1",
 			"category": "development"
 		}
 	]

@@ -27,7 +27,7 @@ export const LANGUAGES = {
 		name: 'Rust',
 		extensions: ['.rs'],
 		languageId: 'rust',
-		note: 'every crate in the repo, including nested ones',
+		note: 'every crate in the repo, including nested ones; answers come back empty for ~15 s while it indexes, so retry an empty first result',
 		watch: ['.rs', '.toml'],
 		server: () => ({ command: 'rust-analyzer', args: [] }),
 		// rust-analyzer alone only finds Cargo.toml at its root and one level down.
