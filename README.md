@@ -43,8 +43,10 @@ so an idle session holds no index in memory:
   for its checkout. The proxy keeps running; it exits only when Claude Code
   shuts it down, and then stops every server it started.
 
-`workspaceSymbol` queries every live server and merges the results, so a
-symbol shows up once per live worktree. Git submodules belong to their
+`workspaceSymbol` queries the session checkout's server (starting it if it
+stopped) and every other running server, and merges the results, so a symbol
+shows up once per running checkout. Each checkout has one server, however
+the client spells its path (drive-letter case, short names). Git submodules belong to their
 superproject's server; a nested clone is its own checkout. Servers run with the session
 root as their working directory, so they never stop a worktree from being
 removed on Windows.
@@ -60,7 +62,8 @@ inotify limits in very large trees.
   `app/src-tauri` get analysis. It also retries requests that get
   `ContentModified` while rust-analyzer reloads, because Claude Code doesn't.
   Under rustup, the proxy starts the toolchain's rust-analyzer directly
-  (`rustup which rust-analyzer`): rustup's own `rust-analyzer` is a proxy
+  (`rustup which rust-analyzer`, run in the server's checkout so its
+  `rust-toolchain.toml` applies): rustup's own `rust-analyzer` is a proxy
   that runs the real server as its child, which stopping it could orphan.
 - **Svelte:** the server comes from the project's `node_modules` if it's
   there, otherwise from the global install next to `node`.
@@ -141,11 +144,14 @@ started with.
   PASS/FAIL lines:
 - `node test/hooks.mjs <scratchDir>` checks what the hooks add.
 - `node test/lifecycle.mjs <scratchDir>` kills the session's and a
-  worktree's server, removes a worktree while its server runs, lets the
-  session's server stop when idle, checks that a server that can't start
-  answers with the reason, and that exit and end of input stop every server.
+  worktree's server, removes a worktree while its server runs, checks the
+  session's server counts toward the cap, lets it stop when idle (one server
+  per checkout however a request spells it), checks that a server that can't
+  start answers with the reason, and that exit and end of input stop every
+  server.
 - `node test/rust.mjs <scratchDir>` checks the proxy holds rust-analyzer
-  itself and that it exits with the proxy.
+  itself, a worktree pinned to another installed toolchain gets that
+  toolchain's server, and every server exits with the proxy.
 - `node test/roots.mjs <scratchDir>` checks a session started in a
   subdirectory roots Lua at the git toplevel (`.luarc.json` applies), a
   sibling worktree gets its own server, and the Lua outline.

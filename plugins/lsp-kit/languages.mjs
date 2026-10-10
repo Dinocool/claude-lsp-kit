@@ -3,7 +3,7 @@
 // rewrites); the hooks read `name`, `extensions`, `note`, `present` and
 // `available`.
 import { execFileSync } from 'node:child_process';
-import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { delimiter, dirname, join } from 'node:path';
 
@@ -31,7 +31,7 @@ export const LANGUAGES = {
 		languageId: 'rust',
 		note: 'every crate in the repo, including nested ones; answers come back empty for ~15 s while it indexes, so retry an empty first result',
 		watch: ['.rs', '.toml'],
-		server: () => ({ command: rustAnalyzer(), args: [] }),
+		server: (root) => ({ command: rustAnalyzer(root), args: [] }),
 		// rust-analyzer alone only finds Cargo.toml at its root and one level down.
 		initializationOptions: (root) => ({ linkedProjects: cargoManifests(root) }),
 		present: (root) => cargoManifests(root, 1).length > 0,
@@ -55,12 +55,16 @@ export const LANGUAGES = {
 // holding a `.git` directory (a main checkout) or a `.git` file pointing into a
 // repo's worktrees/ (a linked worktree). A submodule's `.git` file points into
 // modules/, so a submodule belongs to its superproject. null outside a repo.
+// The path comes back canonical, one spelling per checkout: the client's URIs
+// differ in drive-letter case and 8.3 short names (C:\Users\AESTHE~1), and
+// realpathSync.native returns the true spelling (Node fs docs: realpath(3);
+// libuv uv_fs_realpath: GetFinalPathNameByHandleW on Windows).
 export function gitRoot(dir) {
 	for (let d = dir; ; d = dirname(d)) {
 		const git = join(d, '.git');
 		try {
 			const st = statSync(git, { throwIfNoEntry: false });
-			if (st?.isDirectory() || (st?.isFile() && /^gitdir:.*[\\/]worktrees[\\/]/.test(readFileSync(git, 'utf8')))) return d;
+			if (st?.isDirectory() || (st?.isFile() && /^gitdir:.*[\\/]worktrees[\\/]/.test(readFileSync(git, 'utf8')))) return realpathSync.native(d);
 		} catch {} // unreadable: keep walking up
 		if (dirname(d) === d) return null;
 	}
@@ -125,18 +129,17 @@ export function cargoManifests(dir, max = Infinity, found = []) {
 
 // Under rustup, `rust-analyzer` on PATH is rustup's proxy, which runs the
 // toolchain's server as its own child: stopping the proxy can orphan the real
-// server. The toolchain binary is started directly instead, resolved once per
-// process. Without rustup, the PATH binary is the server itself.
-let rustAnalyzerPath;
-function rustAnalyzer() {
-	if (rustAnalyzerPath) return rustAnalyzerPath;
+// server. The toolchain binary is started directly instead, resolved in the
+// server's root on every start, so a checkout pinned by its own
+// rust-toolchain.toml gets that toolchain's server. Without rustup, the PATH
+// binary is the server itself.
+function rustAnalyzer(root) {
 	try {
-		rustAnalyzerPath = execFileSync('rustup', ['which', 'rust-analyzer'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+		return execFileSync('rustup', ['which', 'rust-analyzer'], { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 	} catch (e) {
-		if (e.code !== 'ENOENT') throw new Error(`rustup which rust-analyzer failed: ${e.stderr?.trim() || e.message}`);
-		rustAnalyzerPath = 'rust-analyzer';
+		if (e.code === 'ENOENT') return 'rust-analyzer';
+		throw new Error(`rustup which rust-analyzer failed: ${e.stderr?.trim() || e.message}`);
 	}
-	return rustAnalyzerPath;
 }
 
 function onPath(command) {

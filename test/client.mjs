@@ -1,6 +1,7 @@
 // The tests' LSP client: drives the proxy like Claude Code does (capabilities {},
 // every server->client request answered null) and keeps the proxy's lsp-kit log.
 import { execSync, spawn } from 'node:child_process';
+import { readlinkSync } from 'node:fs';
 import { basename } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
@@ -19,10 +20,10 @@ export const alive = (pid) => {
 		return e.code === 'EPERM';
 	}
 };
-export const processName = (pid) =>
+export const processPath = (pid) =>
 	process.platform === 'win32'
-		? /^"([^"]+)"/.exec(execSync(`tasklist /FI "PID eq ${pid}" /FO CSV /NH`).toString().trim())?.[1]
-		: execSync(`ps -p ${pid} -o comm=`).toString().trim();
+		? execSync(`powershell -NoProfile -Command "(Get-Process -Id ${pid}).Path"`).toString().trim()
+		: readlinkSync(`/proc/${pid}/exe`);
 
 export function startProxy(language, cwd, env = {}) {
 	const proxy = spawn(process.execPath, [fileURLToPath(new URL('../plugins/lsp-kit/proxy.mjs', import.meta.url)), language], {

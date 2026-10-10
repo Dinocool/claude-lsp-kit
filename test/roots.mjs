@@ -5,17 +5,17 @@
 // Builds a throwaway repo under <dir>.
 // Usage: node test/roots.mjs <scratchDir>   (needs lua-language-server and git)
 import { execSync } from 'node:child_process';
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { check, finish, log, startProxy, wait } from './client.mjs';
 
-const base = process.argv[2];
+rmSync(process.argv[2], { recursive: true, force: true });
+mkdirSync(join(process.argv[2], 'repo', 'addon'), { recursive: true });
+const base = realpathSync.native(process.argv[2]); // the spelling the proxy logs
 const repo = join(base, 'repo');
 const sub = join(repo, 'addon');
 const wt = join(base, 'repo-wt'); // a linked worktree beside the repo, outside the session tree
-rmSync(base, { recursive: true, force: true });
-mkdirSync(sub, { recursive: true });
 const sh = (c, cwd = repo) => execSync(c, { cwd, stdio: 'pipe' }).toString().trim();
 // Lua 5.1: loadstring is current (5.4 flags it "Deprecated"); undefined globals silenced.
 writeFileSync(join(repo, '.luarc.json'), '{"runtime.version":"Lua 5.1","diagnostics.disable":["undefined-global"]}');

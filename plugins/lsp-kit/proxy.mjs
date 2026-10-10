@@ -223,14 +223,8 @@ function exitProxy() {
 	setTimeout(() => process.exit(exitCode()), STOP_KILL_MS + 1000);
 }
 
-// The git toplevel owning the file, else the session root. Matched to a live
-// server's root ignoring case on Windows, where the client's and the server's
-// spellings of a drive letter can differ.
-const samePath = process.platform === 'win32' ? (a, b) => a.toLowerCase() === b.toLowerCase() : (a, b) => a === b;
-function rootFor(uri) {
-	const root = (uri?.startsWith('file:') && gitRoot(dirname(fileURLToPath(uri)))) || sessionRoot;
-	return [...servers.keys()].find((k) => samePath(k, root)) ?? root;
-}
+// The git toplevel owning the file (canonical, so one key per checkout), else the session root.
+const rootFor = (uri) => (uri?.startsWith('file:') && gitRoot(dirname(fileURLToPath(uri)))) || sessionRoot;
 
 function serverFor(root) {
 	const existing = servers.get(root);
