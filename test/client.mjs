@@ -137,7 +137,7 @@ export function startProxy(language, cwd, { name, ...env } = {}) {
 	client.open = (uri, languageId, text) => client.notify('textDocument/didOpen', { textDocument: { uri, languageId, version: 1, text } });
 	// The pid of the newest server the proxy started for `root`, from its start log line.
 	client.pidFor = (root) =>
-		Number(client.stderr.filter((l) => l.includes(` for ${root} (`)).map((l) => /pid (\d+)\)$/.exec(l)?.[1]).at(-1));
+		Number(client.stderr.filter((l) => l.includes(` for ${root} (`)).map((l) => / live, pid (\d+)\)$/.exec(l)?.[1]).filter(Boolean).at(-1));
 	client.pids = () => client.stderr.map((l) => Number(/ live, pid (\d+)\)$/.exec(l)?.[1])).filter(Boolean);
 	client.close = async () => {
 		await client.req('shutdown', null);

@@ -99,4 +99,5 @@ check(alive(lookAlike), `the look-alike lsp-kit didn't start (pid ${lookAlike}) 
 process.kill(lookAlike);
 await later.close();
 check(await until(() => ![stubPid, helperPid, lookAlike].some(alive), 5000), 'no stub process is left running');
+for (const pid of [stubPid, helperPid].filter(alive)) process.kill(pid); // after a failure above
 finish();
