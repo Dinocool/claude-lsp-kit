@@ -4,14 +4,19 @@
 // flight (test/stub-server.mjs posing as svelte-language-server) never stops;
 // a real server's measured memory is plausible. Then the stub's manager is
 // killed and the stub's helper process outlives it (the stub too, off
-// Windows): the next manager's start stops them, and leaves running a
-// look-alike (the same program, orphaned too) that lsp-kit didn't start.
+// Windows): the next manager's start stops them. It leaves running a
+// look-alike (the same program, orphaned too) that lsp-kit didn't start, even
+// with a gone manager's record naming its pid, and the servers of a live
+// manager whose record names a gone pid. A record that can't be written is
+// logged and the manager goes on serving.
 // Usage: node test/memory.mjs <scratchDir>   (needs lua-language-server and git)
 import { execFileSync, execSync } from 'node:child_process';
-import { mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
-import { totalmem } from 'node:os';
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { totalmem, userInfo } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { processes } from '../plugins/lsp-kit/processes.mjs';
+import { pipePath } from '../plugins/lsp-kit/rpc.mjs';
 import { alive, check, finish, killManager, privatePipe, scratch, startProxy, wait } from './client.mjs';
 
 const base = process.argv[2];
@@ -44,6 +49,7 @@ const refs = async (client, dir) => {
 	}
 	return r?.error ? `ERROR ${r.error}` : `${r?.length ?? 0} refs`;
 };
+const RECORDS = `lsp-kit-servers-${userInfo().username}-`; // manager.mjs's record files
 const bytes = (n, unit) => Number(n) * 2 ** (unit === 'GB' ? 30 : 20);
 
 // ---- the memory limit -----------------------------------------------------------
@@ -70,18 +76,36 @@ check(used > 0 && used < totalmem(), `a real server's measured memory is plausib
 check(lua.stderr.some((l) => /Lua server #1 ALONE uses .*, over the memory limit of 1 MB: it stops whenever it has no request in flight/.test(l)), 'a server alone over the limit is named loudly');
 
 // ---- leftover servers -------------------------------------------------------------
-// The tick recorded the stub and its helper. Killing their manager kills the
-// stub on Windows (its job object), not elsewhere; the helper survives either way.
+// The stub and its helper were recorded. Killing their manager kills the stub
+// on Windows (its job object), not elsewhere; the helper survives either way.
 const data = process.env.CLAUDE_PLUGIN_DATA;
 const managerLog = (pipe) => readFileSync(join(data, `${pipe}.log`), 'utf8');
+const records = () => readdirSync(data).filter((f) => f.startsWith(RECORDS) && f.endsWith('.json'));
+const recordOf = (pipe) => records().find((f) => JSON.parse(readFileSync(join(data, f), 'utf8')).pipe === pipePath(pipe, data));
 const stubPid = Number(svelte.stderr.map((l) => /Svelte server #\d+ for .* pid (\d+)\)$/.exec(l)?.[1]).find(Boolean));
 const helperPid = Number(/Svelte server #\d+ stderr: helper pid (\d+)/.exec(managerLog(limited.LSP_KIT_PIPE))?.[1]);
-const record = () => readdirSync(data).filter((f) => f.startsWith('lsp-kit-servers-')).map((f) => readFileSync(join(data, f), 'utf8')).join();
-check([stubPid, helperPid].every((pid) => record().includes(`"pid":${pid},`)), `the manager recorded the stub (pid ${stubPid}) and its helper (pid ${helperPid})`);
-// A look-alike: the same program, started outside lsp-kit by a parent that has exited.
+const recorded = (pipe, pids) => pids.every((pid) => recordOf(pipe) && readFileSync(join(data, recordOf(pipe)), 'utf8').includes(`"pid":${pid},`));
+check(recorded(limited.LSP_KIT_PIPE, [stubPid, helperPid]), `the manager recorded the stub (pid ${stubPid}) and its helper (pid ${helperPid})`);
+
+// A live manager whose record names a gone manager's pid: liveness is its pipe answering.
+const liveEnv = { LSP_KIT_PIPE: privatePipe() };
+const live = startProxy('lua', repo, { ...liveEnv, name: 'live' });
+await live.initialize(repo);
+check((await refs(live, repo)) === '3 refs', 'a live manager serves the main checkout');
+const livePid = live.pidFor(repo);
+check(await until(() => recorded(liveEnv.LSP_KIT_PIPE, [livePid]), 10000), `it recorded its server (pid ${livePid}) at the start`);
+const liveRecord = join(data, recordOf(liveEnv.LSP_KIT_PIPE));
+writeFileSync(liveRecord, JSON.stringify({ ...JSON.parse(readFileSync(liveRecord, 'utf8')), pid: svelte.manager }));
+
+// A look-alike: the same program, started outside lsp-kit by a parent that has
+// exited. A forged record of a gone manager names its pid with another start time.
 const lookAlike = Number(
 	execFileSync(process.execPath, ['-e', `const c = require('child_process').spawn(process.execPath, [${JSON.stringify(stub)}, '--stdio'], { detached: true, stdio: 'ignore', windowsHide: true }); c.unref(); console.log(c.pid)`]).toString()
 );
+const lookAlikeStart = (await processes()).get(lookAlike).created;
+const forged = { pipe: pipePath(privatePipe(), data), pid: 1, processes: [{ pid: lookAlike, created: lookAlikeStart + 1, lang: 'Svelte', root: repo, server: lookAlike }] };
+writeFileSync(join(data, `${RECORDS}forged.json`), JSON.stringify(forged));
+
 killManager(svelte.manager);
 await wait(2000);
 check(alive(helperPid) && !alive(svelte.manager), `the stub's helper (pid ${helperPid}) outlives its killed manager (pid ${svelte.manager}); the stub ${alive(stubPid) ? 'does too' : "doesn't"}`);
@@ -95,9 +119,28 @@ check(
 	swept?.[1] === repo && Number(swept[2]) === stubPid && swept[3].split(', ').includes(String(helperPid)) && Number(swept[4]) === svelte.manager,
 	`it logs the stop with the pids, language and why: ${swept?.[0]}`
 );
-check(alive(lookAlike), `the look-alike lsp-kit didn't start (pid ${lookAlike}) still runs`);
+check(alive(lookAlike) && !existsSync(join(data, `${RECORDS}forged.json`)), `the look-alike lsp-kit didn't start (pid ${lookAlike}) still runs, though a gone manager's record names its pid`);
+check(alive(livePid) && existsSync(liveRecord), `the live manager's server (pid ${livePid}) still runs and its record stays, though the record names a gone pid`);
 process.kill(lookAlike);
 await later.close();
+
+// A record that can't be written (no file may be created in the data folder) is
+// logged, and the manager goes on serving; the next start of a server retries.
+const deny = (on) =>
+	process.platform === 'win32'
+		? execFileSync('icacls', [data, on ? '/deny' : '/remove:d', `${userInfo().username}${on ? ':(WD)' : ''}`], { stdio: 'pipe' })
+		: chmodSync(data, on ? 0o555 : 0o755);
+deny(true);
+let served;
+try {
+	served = await refs(live, wt);
+	await until(() => /servers not recorded \(retried at the next measurement\): /.test(managerLog(liveEnv.LSP_KIT_PIPE)), 10000);
+} finally {
+	deny(false);
+}
+check(/servers not recorded \(retried at the next measurement\): /.test(managerLog(liveEnv.LSP_KIT_PIPE)), 'a record that can not be written is logged');
+check(served === '3 refs' && (await refs(live, repo)) === '3 refs' && alive(live.manager), `the manager (pid ${live.manager}) goes on serving: ${served}`);
+await live.close();
 check(await until(() => ![stubPid, helperPid, lookAlike].some(alive), 5000), 'no stub process is left running');
-for (const pid of [stubPid, helperPid].filter(alive)) process.kill(pid); // after a failure above
+for (const pid of [stubPid, helperPid, lookAlike].filter(alive)) process.kill(pid); // after a failure above
 finish();

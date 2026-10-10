@@ -56,6 +56,7 @@
 //   the session has used, and merges the answers; other workspace-wide
 //   requests go to the session root's server.
 import { spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, watch, writeFileSync } from 'node:fs';
 import { connect, createServer } from 'node:net';
 import { userInfo } from 'node:os';
@@ -141,7 +142,7 @@ listener.listen(PIPE, () => {
 	log(`manager pid ${process.pid} on ${PIPE} (cap ${MAX_SERVERS} servers, memory limit ${size(MAX_MEMORY)}, idle stop ${IDLE_MS / 1000} s)`);
 	const npm = askNpm();
 	log(npm.dir ? `npm's global folder: ${npm.dir}` : npm.error);
-	sweep().catch((e) => log(`leftover servers not swept, and this manager's not recorded: ${e.message}`));
+	sweep().catch((e) => log(`leftover servers not swept: ${e.message}`));
 });
 
 // ---- leftover servers -----------------------------------------------------------
@@ -152,58 +153,94 @@ listener.listen(PIPE, () => {
 // but "*their* subprocesses are not" in it (libuv src/win/process.c):
 // rust-analyzer's proc-macro servers and cargo check. Elsewhere a server hung
 // past its manager's crash never reads the end of its input.
-// So each manager records, at every measurement, each process in its servers'
-// trees in the data dir until it is gone, and the next manager to start stops
-// the recorded processes of managers that are gone, with their descendants. A
-// process is lsp-kit's only by its pid AND creation time as recorded: a
-// process that reused the pid, or one lsp-kit didn't start (another editor's
-// rust-analyzer), is never touched. A marker in each server's environment
-// can't be read back on Windows (no documented API reads another process's
-// environment: RTL_USER_PROCESS_PARAMETERS documents only ImagePathName and
-// CommandLine), and a marker argument breaks servers that reject unknown ones.
+// So each manager records each process in its servers' trees in the data dir
+// (at each server start and measurement, until the process is gone), and the
+// next manager to start stops the recorded processes of managers that are
+// gone, with their descendants.
+// - A manager is gone when its pipe doesn't answer, or is this manager's own
+//   (a pipe has one listener). That needs no clock: a start time read back
+//   from `ps` moves with a clock step, and would make a live manager look gone.
+// - A process is lsp-kit's only by its pid AND creation time, both from one
+//   listing: a process that reused the pid, or one lsp-kit didn't start
+//   (another editor's rust-analyzer), is never touched. A marker in each
+//   server's environment can't be read back on Windows (no documented API
+//   reads another process's environment: RTL_USER_PROCESS_PARAMETERS documents
+//   only ImagePathName and CommandLine), and a marker argument breaks servers
+//   that reject unknown ones.
 const RECORDS = `lsp-kit-servers-${userInfo().username}-`;
-let self = null; // this manager's { pid, created }, once listed
+const RECORD = join(dir, `${RECORDS}${randomUUID()}.json`);
 const owned = new Map(); // pid -> { pid, created, lang, root, server (its server's pid) }, while it lives
 let saved = '';
 
-function saveRecord() {
-	if (!self) return;
-	const text = owned.size ? JSON.stringify({ manager: self, processes: [...owned.values()] }) : '';
-	if (text === saved) return;
-	saved = text;
-	const path = join(dir, `${RECORDS}${self.pid}-${self.created}.json`);
-	if (!text) return rmSync(path, { force: true });
-	writeFileSync(`${path}.tmp`, text);
-	renameSync(`${path}.tmp`, path);
+// Lists the processes and records every running server's tree; resolves to the listing.
+function record() {
+	return processes().then((list) => {
+		for (const [pid, p] of owned) if (!sameProcess(list, p)) owned.delete(pid);
+		for (const s of [...running].filter((s) => list.has(s.child?.pid))) {
+			s.procs = tree(list, s.child.pid);
+			for (const { pid, created } of s.procs) owned.set(pid, { pid, created, lang: s.lang.name, root: s.root, server: s.child.pid });
+		}
+		saveRecord();
+		return list;
+	});
 }
+
+// A write that fails (Windows refuses a rename while another process reads the
+// file) is retried by the next record, never fatal to the manager.
+function saveRecord() {
+	const text = owned.size ? JSON.stringify({ pipe: PIPE, pid: process.pid, processes: [...owned.values()] }) : '';
+	if (text === saved) return;
+	try {
+		if (!text) rmSync(RECORD, { force: true });
+		else {
+			writeFileSync(`${RECORD}.tmp`, text);
+			renameSync(`${RECORD}.tmp`, RECORD);
+		}
+		saved = text;
+	} catch (e) {
+		log(`servers not recorded (retried at the next measurement): ${e.message}`);
+	}
+}
+
+const answers = (pipe) =>
+	new Promise((resolve) => {
+		const probe = connect(pipe);
+		probe.once('connect', () => (probe.destroy(), resolve(true)));
+		probe.once('error', (e) => resolve(e.code !== 'ENOENT' && e.code !== 'ECONNREFUSED')); // anything else: not known gone
+	});
 
 async function sweep() {
 	const list = await processes();
-	self = { pid: process.pid, created: list.get(process.pid).created };
-	for (const file of readdirSync(dir).filter((f) => f.startsWith(RECORDS) && f.endsWith('.json'))) {
+	for (const file of readdirSync(dir).filter((f) => f.startsWith(RECORDS) && f.endsWith('.json') && join(dir, f) !== RECORD)) {
 		const path = join(dir, file);
+		let rec;
 		try {
-			const { manager, processes: recorded } = JSON.parse(readFileSync(path, 'utf8'));
-			if (sameProcess(list, manager)) continue; // its manager runs: this one, or another version's
-			const left = new Map(); // server pid -> { lang, root, pids }
-			for (const p of recorded.filter((p) => sameProcess(list, p))) {
-				if (!left.has(p.server)) left.set(p.server, { lang: p.lang, root: p.root, pids: new Set() });
-				for (const q of tree(list, p.pid)) left.get(p.server).pids.add(q.pid);
-			}
-			for (const [server, { lang, root, pids }] of left) {
-				for (const pid of pids) {
-					try {
-						process.kill(pid);
-					} catch {} // exited meanwhile
-				}
-				log(`stopped what was left of a ${lang} server for ${root} (server pid ${server}): pids ${[...pids].join(', ')}; its manager pid ${manager.pid} is gone`);
-			}
+			rec = JSON.parse(readFileSync(path, 'utf8'));
+			if (typeof rec.pipe !== 'string' || !Array.isArray(rec.processes)) throw new Error('not a server record');
 		} catch (e) {
-			log(`unreadable server record ${file} removed: ${e.message}`);
+			log(`server record ${file} unreadable, left in place: ${e.message}`);
+			continue;
 		}
-		rmSync(path, { force: true });
+		if (rec.pipe !== PIPE && (await answers(rec.pipe))) continue; // its manager runs
+		const left = new Map(); // server pid -> { lang, root, pids }
+		for (const p of rec.processes.filter((p) => sameProcess(list, p))) {
+			if (!left.has(p.server)) left.set(p.server, { lang: p.lang, root: p.root, pids: new Set() });
+			for (const q of tree(list, p.pid)) left.get(p.server).pids.add(q.pid);
+		}
+		for (const [server, { lang, root, pids }] of left) {
+			for (const pid of pids) {
+				try {
+					process.kill(pid);
+				} catch {} // exited meanwhile
+			}
+			log(`stopped what was left of a ${lang} server for ${root} (server pid ${server}): pids ${[...pids].join(', ')}; its manager pid ${rec.pid} is gone`);
+		}
+		try {
+			rmSync(path, { force: true });
+		} catch (e) {
+			log(`server record ${file} not removed: ${e.message}`);
+		}
 	}
-	saveRecord();
 }
 
 // ---- servers ------------------------------------------------------------------
@@ -237,6 +274,7 @@ function startServer(session, root, key, shareKey) {
 		createInterface({ input: server.child.stderr, crlfDelay: Infinity }).on('line', (line) =>
 			logFile(`lsp-kit: ${lang.name} server #${server.no} stderr: ${line.slice(0, STDERR_LINE)}`)
 		);
+		if (server.child.pid) record().catch((e) => log(`${lang.name} server #${server.no} not recorded: ${e.message}`));
 	} catch (e) {
 		server.startError = e.message;
 		setImmediate(() => serverClosed(server));
@@ -324,48 +362,44 @@ function stopServer(server, why) {
 
 const busy = (server) => server.requests.size > 0 || server.waiting.size > 0;
 
-// Room for one more server: least recently used first, never one with a request in flight.
-function makeRoom() {
+// One stopping rule for the cap and the memory limit: while `isOver()`, the
+// least recently used server without a request in flight stops. False when
+// every server left has one (the cap or limit is then exceeded and logged).
+function stopLeastRecent(isOver, why) {
 	const idle = [...servers.values()].filter((s) => !busy(s)).sort((a, b) => a.lastUsed - b.lastUsed);
-	while (servers.size >= MAX_SERVERS && idle.length) stopServer(idle.shift(), `room for another under the cap of ${MAX_SERVERS} servers`);
-	if (servers.size >= MAX_SERVERS) log(`every live server has a request in flight: ${servers.size + 1} exceed the cap of ${MAX_SERVERS}`);
+	while (isOver() && idle.length) stopServer(idle.shift(), why);
+	return !isOver();
 }
 
-// On the reaper tick: every server's process tree recorded
-// (see sweep) and its memory measured, logged when it moved MEMORY_LOG_CHANGE.
-// Then, while the total exceeds MAX_MEMORY, the least recently used server
-// without a request in flight stops. A server that alone exceeds the limit is
+function makeRoom() {
+	if (!stopLeastRecent(() => servers.size >= MAX_SERVERS, `room for another under the cap of ${MAX_SERVERS} servers`))
+		log(`every live server has a request in flight: ${servers.size + 1} exceed the cap of ${MAX_SERVERS}`);
+}
+
+// On the reaper tick: every server's process tree recorded (see sweep) and its
+// memory measured, logged when it moved MEMORY_LOG_CHANGE; then stopLeastRecent
+// while the total exceeds MAX_MEMORY. A server that alone exceeds the limit is
 // no exception: it can't fit beside any other, and a leak that size is what the
-// limit is for. It stops whenever it has no request in flight, and the log says
-// so once, loudly.
+// limit is for. It stops whenever it has no request in flight, after any idle
+// server used less recently, and the log says so once, loudly.
 function measure() {
 	if (!servers.size) return;
-	processes().then(
+	record().then(
 		(list) => {
-			for (const [pid, p] of owned) if (!sameProcess(list, p)) owned.delete(pid);
-			const live = [...servers.values()].filter((s) => list.has(s.child?.pid));
-			for (const s of live) {
-				const procs = tree(list, s.child.pid);
-				for (const { pid, created } of procs) owned.set(pid, { pid, created, lang: s.lang.name, root: s.root, server: s.child.pid });
-				s.memory = procs.reduce((n, p) => n + p.bytes, 0);
+			for (const s of [...servers.values()].filter((s) => list.has(s.child?.pid))) {
+				s.memory = s.procs.reduce((n, p) => n + p.bytes, 0);
 				if (s.logged === undefined || Math.abs(s.memory - s.logged) >= MEMORY_LOG_CHANGE * s.logged) {
 					s.logged = s.memory;
-					log(`${s.lang.name} server #${s.no} (pid ${s.child.pid}, ${procs.length} process${procs.length > 1 ? 'es' : ''}) uses ${size(s.memory)}`);
+					log(`${s.lang.name} server #${s.no} (pid ${s.child.pid}, ${s.procs.length} process${s.procs.length > 1 ? 'es' : ''}) uses ${size(s.memory)}`);
 				}
 				if (s.memory > MAX_MEMORY && !s.overAlone) {
 					s.overAlone = true;
 					log(`${s.lang.name} server #${s.no} ALONE uses ${size(s.memory)}, over the memory limit of ${size(MAX_MEMORY)}: it stops whenever it has no request in flight (LSP_KIT_MAX_MEMORY_MB sets the limit)`);
 				}
 			}
-			saveRecord();
-			let total = live.reduce((n, s) => n + s.memory, 0);
-			const idle = live.filter((s) => !busy(s)).sort((a, b) => a.lastUsed - b.lastUsed);
-			while (total > MAX_MEMORY && idle.length) {
-				const s = idle.shift();
-				stopServer(s, `the servers use ${size(total)}, over the memory limit of ${size(MAX_MEMORY)}`);
-				total -= s.memory;
-			}
-			if (total > MAX_MEMORY) log(`every server left has a request in flight: their ${size(total)} exceed the memory limit of ${size(MAX_MEMORY)}`);
+			const total = () => [...servers.values()].reduce((n, s) => n + (s.memory ?? 0), 0);
+			if (!stopLeastRecent(() => total() > MAX_MEMORY, `over the memory limit of ${size(MAX_MEMORY)}`))
+				log(`every server left has a request in flight: their ${size(total())} exceed the memory limit of ${size(MAX_MEMORY)}`);
 		},
 		(e) => log(`memory not measured, so its limit wasn't applied and its servers not recorded this time: ${e.message}`)
 	);
