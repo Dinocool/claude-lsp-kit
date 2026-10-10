@@ -172,7 +172,7 @@ listener.listen(PIPE, () => {
 //   before its spawn and removed when it closes; the sweep removes those of a
 //   gone manager after stopping its processes.
 const RECORDS = `lsp-kit-servers-${userInfo().username}-`;
-const SERVER_DIRS = `lsp-kit-server-dir-${userInfo().username}-`;
+const SERVER_DIRS = 'lsp-kit-tmp-'; // short: LuaLS's socket path inside must fit 107 bytes (languages.mjs)
 const ID = randomUUID();
 const RECORD = join(dir, `${RECORDS}${ID}.json`);
 const RECORD_ID = 'lsp-kit/record-id'; // another manager's liveness probe (see gone), answered with ID
@@ -305,7 +305,7 @@ function startServer(session, root, key, shareKey) {
 		// without it each server would get a visible console window of its own.
 		// A language's env hook (languages.mjs) gets a folder of the server's own.
 		if (lang.env) {
-			server.ownDir = join(dir, `${SERVER_DIRS}${ID}-${server.no}`);
+			server.ownDir = join(dir, `${SERVER_DIRS}${ID.slice(0, 8)}-${server.no}`);
 			mkdirSync(server.ownDir, { recursive: true });
 			serverDirs.add(server.ownDir);
 			saveRecord();

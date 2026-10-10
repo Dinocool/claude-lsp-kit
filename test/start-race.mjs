@@ -5,12 +5,15 @@
 // Ten rounds, each on a manager of its own: a session on the repo, then one
 // request to each of eight worktrees at once, so eight servers start together.
 // Each round's manager is then killed, and the next manager's sweep removes
-// the folders its servers left; a server that stops removes its own.
+// the folders its servers left; a server that stops removes its own. The
+// plugin data folder is as long as the one Claude Code gives lsp-kit, since a
+// socket path past 107 bytes defeats the TMP of its own; past that, a server's
+// start fails with the reason.
 // Builds a throwaway repo under <dir>.
 // Usage: node test/start-race.mjs <scratchDir>   (needs lua-language-server and git)
 import { execSync } from 'node:child_process';
 import { mkdirSync, readdirSync, realpathSync, writeFileSync } from 'node:fs';
-import { userInfo } from 'node:os';
+import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { LANGUAGES } from '../plugins/lsp-kit/languages.mjs';
@@ -23,6 +26,9 @@ if (!LANGUAGES.lua.available()) {
 const ROUNDS = 10;
 const TOGETHER = 8;
 scratch(process.argv[2]);
+// CLAUDE_PLUGIN_DATA is ~/.claude/plugins/data/<plugin>-<marketplace> (Claude Code plugins reference).
+const realData = join(homedir(), '.claude', 'plugins', 'data', 'lsp-kit-claude-lsp-kit');
+const data = (process.env.CLAUDE_PLUGIN_DATA = join(process.argv[2], 'd'.repeat(Math.max(1, realData.length - process.argv[2].length - 1))));
 mkdirSync(join(process.argv[2], 'repo'), { recursive: true });
 const repo = realpathSync.native(join(process.argv[2], 'repo'));
 const sh = (c) => execSync(c, { cwd: repo, stdio: 'pipe' }).toString().trim();
@@ -31,8 +37,7 @@ writeFileSync(join(repo, 'a.lua'), 'local function helper(x) return x end\nhelpe
 sh('git init -q && git add -A && git -c user.email=t@t -c user.name=t commit -qm init');
 const worktrees = [...Array(TOGETHER)].map((_, i) => (sh(`git worktree add -q .claude/worktrees/w${i}`), join(repo, '.claude', 'worktrees', `w${i}`)));
 
-const data = process.env.CLAUDE_PLUGIN_DATA;
-const SERVER_DIRS = `lsp-kit-server-dir-${userInfo().username}-`; // manager.mjs's server folders
+const SERVER_DIRS = 'lsp-kit-tmp-'; // manager.mjs's server folders
 const serverDirs = () => readdirSync(data).filter((f) => f.startsWith(SERVER_DIRS));
 const until = async (cond, ms) => {
 	for (const end = Date.now() + ms; !cond() && Date.now() < end; ) await wait(200);
@@ -71,4 +76,11 @@ check((await refs(last, repo)) === '3 refs', 'a last manager serves the repo');
 check(await until(() => serverDirs().length === 1, 10000), `its sweep removed the killed manager's folders (${serverDirs().length} left)`);
 await last.close();
 check(await until(() => serverDirs().length === 0, 15000), `its server stopped when idle and removed its folder (${serverDirs().join(', ') || 'none left'})`);
+
+if (process.platform === 'win32') {
+	const long = startProxy('lua', repo, { name: 'long', CLAUDE_PLUGIN_DATA: join(process.argv[2], 'l'.repeat(100)) });
+	const init = await long.initialize(repo);
+	check(/socket file .* past the 107 a Windows socket path takes/.test(init?.error), `with a plugin data folder too long, the start fails with the reason (${init?.error})`);
+	await long.close();
+}
 finish();

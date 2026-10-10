@@ -67,11 +67,20 @@ export const LANGUAGES = {
 		// for good (pair's select has no timeout) or exits on "Duplicate channel
 		// 'task:1'": channelmgr::create returns null for a failed pair as for a
 		// duplicate name. Measured: 17 of 120 simultaneous starts exited so, none
-		// with a TMP each (GetTempPathW reads TMP, then TEMP). Sources:
+		// with a TMP each (GetTempPathW reads TMP, then TEMP). The socket file's
+		// path must fit a sockaddr_un (UNIX_PATH_MAX, 108 bytes with its NUL:
+		// endpoint::ctor_unix); a longer one falls through to C:\Windows\Temp\,
+		// shared again (43 of 120 died so), so the start fails with the reason.
+		// Sources:
 		// https://github.com/actboy168/bee.lua/blob/master/bee/net/socket.cpp
+		// https://github.com/actboy168/bee.lua/blob/master/bee/net/endpoint.cpp
 		// https://github.com/actboy168/bee.lua/blob/master/binding/lua_channel.cpp
 		// https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-gettemppathw
-		env: (dir) => ({ TMP: dir, TEMP: dir }),
+		env: (dir) => {
+			const socket = join(dir, 'bee1.tmp');
+			if (process.platform === 'win32' && Buffer.byteLength(socket) >= 108) throw new Error(`its socket file ${socket} is ${Buffer.byteLength(socket)} bytes long, past the 107 a Windows socket path takes: the plugin data folder's path is too long`);
+			return { TMP: dir, TEMP: dir };
+		},
 		results: { 'textDocument/documentSymbol': luaOutline },
 		// Without a .luarc.json bounding the workspace, LuaLS scans every file under the root.
 		present: (root) => existsSync(join(root, '.luarc.json')) || existsSync(join(root, '.luarc.jsonc')),

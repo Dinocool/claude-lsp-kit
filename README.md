@@ -260,6 +260,11 @@ checkout, pids and the gone manager.
     loser hangs or exits with "Duplicate channel 'task:1'". In a trial, 17 of
     120 servers started together exited that way. With a folder each, none
     did. Two checkouts whose Lua servers start together are enough to hit it.
+  - That file's path must fit in 107 bytes, the most a Windows socket path
+    takes ([endpoint.cpp](https://github.com/actboy168/bee.lua/blob/master/bee/net/endpoint.cpp)).
+    A longer one falls back to the shared `C:\Windows\Temp`, so a Lua server
+    whose plugin data path is too long fails to start, naming the path.
+
 If a server isn't installed, `initialize` and each later request fail with a
 message that names it.
 
@@ -402,7 +407,8 @@ started with, and with it its manager.
 - `node test/smoke.mjs <svelte|typescript|rust|lua> <root> <hover|references|documentSymbol|definition> <file:line:col>...`
   drives the proxy like Claude Code does, on a private manager.
 - Each test below builds a throwaway project under `<scratchDir>`, runs its
-  own private managers, and prints PASS/FAIL lines:
+  own private managers, and prints PASS/FAIL lines. On Windows the Lua tests
+  need a `<scratchDir>` of at most 60 characters (see the Lua socket path):
 - `node test/hooks.mjs <scratchDir>` checks what the hooks add, with a
   stub TypeScript 6 (not served) and then 7, and an empty npm global folder.
 - `node test/shared.mjs <scratchDir>` checks two sessions on one checkout
@@ -467,7 +473,8 @@ started with, and with it its manager.
   same instant, ten rounds, each on a new manager. It checks every one
   answers, each live server has one folder of its own, and the next
   manager's sweep removes the folders of a killed one. A server that stops
-  when idle removes its own.
+  when idle removes its own. Its plugin data path is as long as Claude
+  Code's, and a longer one makes the start fail with the reason.
 - `node tools/settings-trial.mjs <rust|lua> <root> <scratchDir> <file>... [--runs n]`
   is no test: it runs each candidate setting on `<root>` and prints the
   table in [Settings](#settings). `<file>`s are the lookups' source and the
