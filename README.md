@@ -249,6 +249,62 @@ checkout, pids and the gone manager.
 If a server isn't installed, `initialize` and each later request fail with a
 message that names it.
 
+## Settings
+
+lsp-kit gives rust-analyzer one setting, `linkedProjects` (see Per-language
+setup), and the other servers none: everything else is the server's own
+default or the project's config. Settings that could cut memory were tried
+with `tools/settings-trial.mjs` on a real repo: four Cargo workspaces, one of
+them a Tauri app, and a WoW addon of about 180 Lua files with its own
+`.luarc.json`. Each candidate ran the real server three times. Its
+memory was read as the manager reads it, once indexing settled and again
+after 53 fixed lookups (definitions, references, hover, document and
+workspace symbols), and its answers and the diagnostics of three open files
+were compared exactly with the defaults'. None cut memory with identical
+answers, so none is a default.
+
+| Server, setting | Memory after the lookups | Answers |
+|---|---|---|
+| rust-analyzer, defaults | 3.4 GB | |
+| `cachePriming.enable: false` | 0.5 GB until the first workspace-wide lookup, then 3.6 GB | a macro-made symbol's location differed in one run |
+| `lru.capacity: 32` (default 128) | 3.4 to 3.5 GB | same |
+| `numThreads: 2` | 3.4 GB | same |
+| `procMacro.enable: false` | 3.3 GB | macros unexpanded: "proc-macro expansion is disabled" errors |
+| `cargo.targetDir: true` | 3.4 GB, plus 1.9 GB of disk | same |
+| LuaLS, defaults | 1.0 to 1.3 GB | |
+| `diagnostics.workspaceDelay: -1` | 0.5 GB until the lookups, then 0.9 to 1.1 GB | unopened files are no longer diagnosed, so an edit's errors in other files go unseen |
+| `workspace.maxPreload: 100` | 0.6 to 0.8 GB | files past the limit lose definitions and references |
+| `workspace.preloadFileSize: 100` | 0.8 to 0.9 GB | the same for files over 100 KB |
+| the addon's `Libs` folder as `workspace.library` | 1.0 GB, within the defaults' spread | same: a folder inside the workspace stays a workspace folder |
+| the addon's `Libs` folder in `workspace.ignoreDir` | 1.0 GB | its symbols are gone |
+
+- Rust check-on-save stays on: cross-file errors after an edit come from it.
+- `cargo.targetDir: true` doesn't save memory. It gives rust-analyzer's cargo
+  check its own `target/rust-analyzer`, so it never waits on the lock of a
+  build the user started, at the cost of a second build tree.
+- Some answers vary between runs of the same settings: rust-analyzer's
+  reference counts by one or two, LuaLS's type-mismatch diagnostics in a
+  large file. The trial leaves out an answer that varies between the
+  defaults' own runs.
+- Sources: rust-analyzer's manual,
+  [Configuration](https://rust-analyzer.github.io/book/configuration.html),
+  and its `crates/rust-analyzer/src/config.rs` for which source wins; the
+  LuaLS wiki's [Settings](https://luals.github.io/wiki/settings/) and
+  [Configuration](https://luals.github.io/wiki/configuration/) pages.
+
+A project tunes its servers in its own files:
+
+- **Lua:** `.luarc.json` at the repo root. LuaLS reads `--configpath` first,
+  then `.luarc.json`, then the client's settings, key by key; lsp-kit sends
+  no client settings.
+- **Rust:** a `rust-analyzer.toml` in the project root (the manual calls it
+  work in progress) sets the per-workspace settings, such as `cargo.*` and
+  `check.*`. The machine-wide ones, such as `cachePriming`, `lru`,
+  `numThreads`, `procMacro` and `files.exclude`, come only from the client
+  or the user's own `rust-analyzer.toml` in the user config folder
+  (`%APPDATA%\rust-analyzer` on Windows, `~/.config/rust-analyzer` on
+  Linux). lsp-kit sends only `linkedProjects`, so that file applies.
+
 ## Hooks: advertise the LSP and use it
 
 The plugin's hooks only add context and never block a tool call:
@@ -391,6 +447,13 @@ started with, and with it its manager.
 - `node test/roots.mjs <scratchDir>` checks a session started in a
   subdirectory roots Lua at the git toplevel (`.luarc.json` applies), a
   sibling worktree gets its own server, and the Lua outline.
+- `node tools/settings-trial.mjs <rust|lua> <root> <scratchDir> <file>... [--runs n]`
+  is no test: it runs each candidate setting on `<root>` and prints the
+  table in [Settings](#settings). `<file>`s are the lookups' source and the
+  diagnostics compared. Each run's results stay in `<scratchDir>`, so a rerun
+  only runs what is missing. It writes into `<root>`: rust-analyzer's build
+  trees, and for a `.luarc.json` candidate the file itself (restored after).
+  Point it at a copy.
 
 ## License
 
