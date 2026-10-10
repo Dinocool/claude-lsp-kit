@@ -154,8 +154,10 @@ stops every recorded process that's still running while the manager that
 recorded it is gone, with its child processes. The log names the language,
 checkout, pids and the gone manager.
 
-- A manager is gone when its pipe no longer answers. That needs no clock, so
-  a clock change can't make a live manager look gone.
+- A manager is gone unless its pipe answers with the record's id. A manager
+  restarted on the same pipe has a new id, so its predecessor's record is
+  swept. That needs no clock, so a clock change can't make a live manager
+  look gone. A pipe that doesn't answer within 5 s counts as alive.
 - A process counts as lsp-kit's by its pid and start time together, so a
   later process that reuses the pid is never stopped.
 - A server lsp-kit didn't start, such as an editor's own rust-analyzer, is
@@ -356,7 +358,8 @@ started with, and with it its manager.
   (and the stub, off Windows) outlives it. The next manager's start stops
   them and logs it. A look-alike lsp-kit didn't start, the same program also
   without a live parent, keeps running, even with a gone manager's record
-  naming its pid. So do a live manager's server and its record. With file
+  naming its pid. So do a live manager's server and its record. A record
+  naming the new manager's own pipe under another id is swept. With file
   creation denied in the data folder, the failed record write is logged and
   the manager goes on serving.
 - `node test/typescript.mjs <scratchDir>` installs TypeScript 7 into its

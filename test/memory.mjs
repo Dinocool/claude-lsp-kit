@@ -10,7 +10,7 @@
 // manager whose record names a gone pid. A record that can't be written is
 // logged and the manager goes on serving.
 // Usage: node test/memory.mjs <scratchDir>   (needs lua-language-server and git)
-import { execFileSync, execSync } from 'node:child_process';
+import { execFileSync, execSync, spawn } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { totalmem, userInfo } from 'node:os';
 import { join } from 'node:path';
@@ -102,14 +102,21 @@ const lookAlike = Number(
 	execFileSync(process.execPath, ['-e', `const c = require('child_process').spawn(process.execPath, [${JSON.stringify(stub)}, '--stdio'], { detached: true, stdio: 'ignore', windowsHide: true }); c.unref(); console.log(c.pid)`]).toString()
 );
 const lookAlikeStart = (await processes()).get(lookAlike).created;
-const forged = { pipe: pipePath(privatePipe(), data), pid: 1, processes: [{ pid: lookAlike, created: lookAlikeStart + 1, lang: 'Svelte', root: repo, server: lookAlike }] };
+const forged = { id: 'forged', pipe: pipePath(privatePipe(), data), pid: 1, processes: [{ pid: lookAlike, created: lookAlikeStart + 1, lang: 'Svelte', root: repo, server: lookAlike }] };
 writeFileSync(join(data, `${RECORDS}forged.json`), JSON.stringify(forged));
+
+// A record naming the next manager's own pipe under another id: a predecessor's.
+const next = { LSP_KIT_PIPE: privatePipe() };
+const predecessor = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1 << 30)'], { stdio: 'ignore', windowsHide: true }).pid;
+const predecessorStart = (await processes()).get(predecessor).created;
+const samePath = join(data, `${RECORDS}same-path.json`);
+const predecessorRecord = { id: 'a-predecessor', pipe: pipePath(next.LSP_KIT_PIPE, data), pid: 1, processes: [{ pid: predecessor, created: predecessorStart, lang: 'Lua', root: repo, server: predecessor }] };
+writeFileSync(samePath, JSON.stringify(predecessorRecord));
 
 killManager(svelte.manager);
 await wait(2000);
 check(alive(helperPid) && !alive(svelte.manager), `the stub's helper (pid ${helperPid}) outlives its killed manager (pid ${svelte.manager}); the stub ${alive(stubPid) ? 'does too' : "doesn't"}`);
 
-const next = { LSP_KIT_PIPE: privatePipe() };
 const later = startProxy('lua', repo, { ...next, name: 'next' });
 await later.initialize(repo);
 check(await until(() => ![stubPid, helperPid].some(alive), 15000), "the next manager's start stops what was left of the stub");
@@ -120,6 +127,7 @@ check(
 );
 const forgedPath = join(data, `${RECORDS}forged.json`);
 check(await until(() => !existsSync(forgedPath), 15000), "the sweep finishes: the gone manager's forged record is removed");
+check(!alive(predecessor) && !existsSync(samePath), `a record naming this manager's own pipe under another id is swept: its process (pid ${predecessor}) stopped`);
 check(alive(lookAlike), `the look-alike lsp-kit didn't start (pid ${lookAlike}) still runs, though a gone manager's record names its pid`);
 check(alive(livePid) && existsSync(liveRecord), `the live manager's server (pid ${livePid}) still runs and its record stays`);
 const stop = (pid) => {
@@ -148,5 +156,5 @@ check(/servers not recorded \(retried at the next measurement\): /.test(managerL
 check(served === '3 refs' && (await refs(live, repo)) === '3 refs' && alive(live.manager), `the manager (pid ${live.manager}) goes on serving: ${served}`);
 await live.close();
 check(await until(() => ![stubPid, helperPid, lookAlike].some(alive), 5000), 'no stub process is left running');
-[stubPid, helperPid, lookAlike].forEach(stop); // after a failure above
+[stubPid, helperPid, lookAlike, predecessor].forEach(stop); // after a failure above
 finish();
