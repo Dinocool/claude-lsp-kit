@@ -166,7 +166,7 @@ checkout, pids and the gone manager.
 - A record also lists its servers' own folders (LuaLS's `TMP`, see
   Per-language setup), written before each server starts. A server's folder
   goes when it stops; the sweep removes a gone manager's after stopping its
-  processes. Only folders named `lsp-kit-server-dir-<user>-…` in the data
+  processes. Only folders named `lsp-kit-tmp-…` in the data
   directory are removed, and one still in use keeps its record for the next
   sweep.
 - A record is removed only once its manager is gone. One that can't be read
