@@ -123,8 +123,10 @@ own servers once took 24 GB and the machine ran out of commit.
   - On Windows it is commit charge (Win32_Process `PageFileUsage`), what the
     machine ran out of.
   - Elsewhere it is resident memory (`ps` rss).
-- A server that alone uses more than the limit stops whenever it has no
-  request in flight, like any other. The log names it once, in capitals.
+- A server that alone uses more than the limit follows the same rule. It
+  stops whenever it has no request in flight, after any idle server used less
+  recently. The log names it once per start, in capitals.
+- The memory limit and the server cap stop servers by this same rule.
 - The log shows each server's memory when first measured, after each change
   of 10% or more, and at its stop, for example
   `Rust server #2 (pid 1234, 3 processes) uses 3.4 GB`.
@@ -145,18 +147,25 @@ A server's processes can outlive its manager.
   manager, but not the servers' own child processes.
 - Elsewhere, a server that hangs past its manager's crash never notices it.
 
-Each manager records the processes of its servers on every measurement, in
-`lsp-kit-servers-<user>-<pid>-<start>.json` in the plugin data directory. The
-next manager to start stops every recorded process that's still running
-while the manager that recorded it is gone, with its child processes. The log
-names the language, checkout, pids and the gone manager.
+Each manager records the processes of its servers when each server starts
+and on every measurement. The record is `lsp-kit-servers-<user>-<id>.json` in
+the plugin data directory, with the manager's pipe. The next manager to start
+stops every recorded process that's still running while the manager that
+recorded it is gone, with its child processes. The log names the language,
+checkout, pids and the gone manager.
 
+- A manager is gone when its pipe no longer answers. That needs no clock, so
+  a clock change can't make a live manager look gone.
 - A process counts as lsp-kit's by its pid and start time together, so a
   later process that reuses the pid is never stopped.
 - A server lsp-kit didn't start, such as an editor's own rust-analyzer, is
   never stopped. It isn't in any record.
-- A server that starts and is left behind within one measurement interval
-  isn't recorded yet, so it isn't stopped.
+- A record is removed only once its manager is gone. One that can't be read
+  is logged and left in place.
+- A record that can't be written is logged, and the next measurement tries
+  again; the manager goes on serving.
+- Helper processes a server starts after the last measurement aren't
+  recorded yet.
 - Processes left by lsp-kit before 3.2.0 have no record and aren't stopped.
 
 ### Limits
@@ -346,7 +355,10 @@ started with, and with it its manager.
   machine's. Then it kills the stub's manager: the stub's helper process
   (and the stub, off Windows) outlives it. The next manager's start stops
   them and logs it. A look-alike lsp-kit didn't start, the same program also
-  without a live parent, keeps running.
+  without a live parent, keeps running, even with a gone manager's record
+  naming its pid. So does a live manager's server whose record names a gone
+  pid. With file creation denied in the data folder, the failed record write
+  is logged and the manager goes on serving.
 - `node test/typescript.mjs <scratchDir>` installs TypeScript 7 into its
   project (npm, so the first run needs the registry or npm's cache). It checks
   definitions and references across two `.ts` files and an `.mjs` file
