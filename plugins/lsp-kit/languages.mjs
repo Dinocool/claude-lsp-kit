@@ -1,7 +1,8 @@
 // The languages lsp-kit serves. The proxy reads `server`, `languageId`,
-// `watch` and `initializationOptions`; the hooks read `name`, `extensions`,
-// `note`, `present` and `available`.
-import { existsSync, readdirSync } from 'node:fs';
+// `watch`, `initializationOptions` and `results` (per-method response
+// rewrites); the hooks read `name`, `extensions`, `note`, `present` and
+// `available`.
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { delimiter, dirname, join } from 'node:path';
 
@@ -39,14 +40,53 @@ export const LANGUAGES = {
 		name: 'Lua',
 		extensions: ['.lua'],
 		languageId: 'lua',
-		note: 'scope and runtime from the project .luarc.json',
+		note: 'scope and runtime from the project .luarc.json; documentSymbol outlines functions and file-level tables, not locals inside functions (workspaceSymbol finds those by name)',
 		watch: ['.lua'],
 		server: () => ({ command: 'lua-language-server', args: [] }),
+		results: { 'textDocument/documentSymbol': luaOutline },
 		// Without a .luarc.json bounding the workspace, LuaLS scans every file under the root.
 		present: (root) => existsSync(join(root, '.luarc.json')) || existsSync(join(root, '.luarc.jsonc')),
 		available: () => onPath('lua-language-server')
 	}
 };
+
+// The git toplevel owning `dir` (dir itself included): the nearest directory
+// holding a `.git` directory (a main checkout) or a `.git` file pointing into a
+// repo's worktrees/ (a linked worktree). A submodule's `.git` file points into
+// modules/, so a submodule belongs to its superproject. null outside a repo.
+export function gitRoot(dir) {
+	for (let d = dir; ; d = dirname(d)) {
+		const git = join(d, '.git');
+		try {
+			const st = statSync(git, { throwIfNoEntry: false });
+			if (st?.isDirectory() || (st?.isFile() && /^gitdir:.*[\\/]worktrees[\\/]/.test(readFileSync(git, 'utf8')))) return d;
+		} catch {} // unreadable: keep walking up
+		if (dirname(d) === d) return null;
+	}
+}
+
+// LuaLS's documentSymbol lists every local, parameter and if/for block of every
+// function body: thousands of entries in a large file. The outline keeps what
+// navigation needs, with ranges intact:
+// - every symbol at file level and in table constructors at file level
+//   (functions, methods, variables, named fields; not array items `[1]`);
+// - inside a function body, only named functions (nested helpers, not the
+//   anonymous callbacks LuaLS names after the call they're passed to, detail "-> ...");
+// - control blocks (kind Package: if/for/do) vanish, their kept contents hoisted.
+// A flat SymbolInformation[] answer (no `children`) passes through unchanged.
+const LUA_FUNCTION_KINDS = new Set([6, 12]); // Method, Function
+const LUA_BLOCK_KIND = 4;
+export function luaOutline(symbols) {
+	if (!Array.isArray(symbols) || symbols.some((s) => !s.range)) return symbols;
+	const walk = (list, inFunction) =>
+		(list ?? []).flatMap((s) => {
+			const fn = LUA_FUNCTION_KINDS.has(s.kind) && !s.detail?.startsWith('->');
+			const keep = fn || (!inFunction && s.kind !== LUA_BLOCK_KIND && !s.name.startsWith('['));
+			const children = walk(s.children, inFunction || LUA_FUNCTION_KINDS.has(s.kind));
+			return keep ? [{ ...s, children }] : children;
+		});
+	return walk(symbols, false);
+}
 
 // The project's own svelte-language-server first, then the global install next to
 // this node binary (Windows: <prefix>/node_modules, unix: <prefix>/lib/node_modules).

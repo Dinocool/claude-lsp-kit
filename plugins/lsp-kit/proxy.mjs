@@ -1,8 +1,9 @@
 // Stdio proxy between Claude Code's LSP client and one language server per
 // git root. Usage: node proxy.mjs <language>   (a key of LANGUAGES)
 //
-// Claude Code starts one server per language, rooted at the session directory.
-// The proxy fixes three problems with that:
+// Claude Code starts one server per language, rooted at the session's working
+// directory, which can be any subdirectory of the repo. The proxy fixes four
+// problems with that:
 //
 // 1. Watcher fallback. Claude Code's client does not advertise
 //    `workspace.didChangeWatchedFiles`, so servers fall back to their own
@@ -12,17 +13,23 @@
 //    registration and feeds changes from ONE native recursive fs.watch per
 //    server, skipping dot-directories, node_modules and target.
 //
-// 2. Worktrees. Agents edit files in git worktrees nested in the session root
-//    (e.g. .claude/worktrees/<name>). A file's server root is the nearest
-//    directory holding a `.git` entry below the session root, else the session
-//    root, so an agent's LSP calls see its worktree's code, not main's.
-//    Worktree servers start on first use. The session root's server answers
-//    `initialize` and lives as long as the proxy; at most
-//    MAX_WORKTREE_SERVERS others run at once (least recently used stops
-//    first), and each stops after IDLE_MS unused or once its directory is gone.
+// 2. Roots. Project config lives at the repo root (.luarc.json, the Cargo
+//    workspace, svelte.config.*), and LuaLS reads .luarc.json only from its
+//    workspace root. Every server is rooted at a git toplevel (gitRoot in
+//    languages.mjs): the session root is the toplevel of the client's folder,
+//    and a file goes to the toplevel of the checkout that owns it.
 //
-// 3. Per-language setup from languages.mjs (server command, initialization
-//    options such as rust-analyzer's linkedProjects for nested crates).
+// 3. Worktrees. Agents edit files in linked git worktrees (e.g.
+//    .claude/worktrees/<name>, or a sibling directory), so an agent's LSP calls
+//    see its worktree's code, not main's. Worktree servers start on first use.
+//    The session root's server answers `initialize` and lives as long as the
+//    proxy; at most MAX_WORKTREE_SERVERS others run at once (least recently
+//    used stops first), and each stops after IDLE_MS unused or once its
+//    directory is gone.
+//
+// 4. Per-language setup from languages.mjs (server command, initialization
+//    options such as rust-analyzer's linkedProjects for nested crates, response
+//    rewrites such as the Lua documentSymbol outline).
 //
 // A document routed to a server that doesn't have it open (fresh or
 // restarted) is opened from disk first. workspace/symbol asks every live
@@ -34,9 +41,9 @@
 // "<serverNo>:<id>" so the client's answers can be routed back.
 import { spawn } from 'node:child_process';
 import { existsSync, readFileSync, statSync, watch } from 'node:fs';
-import { dirname, extname, isAbsolute, join, relative, sep } from 'node:path';
+import { dirname, extname, join, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { LANGUAGES } from './languages.mjs';
+import { LANGUAGES, gitRoot } from './languages.mjs';
 
 const MAX_WORKTREE_SERVERS = 3;
 const IDLE_MS = 10 * 60 * 1000;
@@ -182,26 +189,13 @@ function stopServer(server) {
 	setTimeout(() => server.child?.kill(), 5000).unref();
 }
 
-// The nearest linked git worktree strictly below the session root: a directory
-// whose `.git` is a file pointing into a repo's worktrees/ (submodules and
-// nested clones belong to the session's server).
+// The git toplevel owning the file, else the session root. Matched to a live
+// server's root ignoring case on Windows, where the client's and the server's
+// spellings of a drive letter can differ.
+const samePath = process.platform === 'win32' ? (a, b) => a.toLowerCase() === b.toLowerCase() : (a, b) => a === b;
 function rootFor(uri) {
-	if (!uri?.startsWith('file:')) return sessionRoot;
-	const path = fileURLToPath(uri);
-	const rel = relative(sessionRoot, path);
-	if (isAbsolute(rel) || rel.startsWith('..')) return sessionRoot;
-	for (let dir = dirname(path); dir.length > sessionRoot.length; dir = dirname(dir)) {
-		if (isWorktree(dir)) return dir;
-	}
-	return sessionRoot;
-}
-
-function isWorktree(dir) {
-	try {
-		return /^gitdir:.*[\\/]worktrees[\\/]/.test(readFileSync(join(dir, '.git'), 'utf8'));
-	} catch {
-		return false; // no .git, or a .git directory
-	}
+	const root = (uri?.startsWith('file:') && gitRoot(dirname(fileURLToPath(uri)))) || sessionRoot;
+	return [...servers.keys()].find((k) => samePath(k, root)) ?? root;
 }
 
 function serverFor(root) {
@@ -226,7 +220,8 @@ readFrames(process.stdin, (msg) => {
 	if (msg.method === 'initialize') {
 		clientInit = msg;
 		const folder = msg.params?.workspaceFolders?.[0]?.uri ?? msg.params?.rootUri;
-		sessionRoot = folder ? fileURLToPath(folder) : process.cwd();
+		const dir = folder ? fileURLToPath(folder) : process.cwd();
+		sessionRoot = gitRoot(dir) ?? dir;
 		startServer(sessionRoot).initialized?.then((result) => toClient({ jsonrpc: '2.0', id: msg.id, result }));
 		return;
 	}
@@ -327,7 +322,8 @@ function fromServer(server, msg) {
 			return;
 		}
 		pendingClientRequests.delete(msg.id);
-		toClient(msg);
+		const rewrite = pending && msg.result && lang.results?.[pending.msg.method];
+		toClient(rewrite ? { ...msg, result: rewrite(msg.result) } : msg);
 		return;
 	}
 	if (msg.method === 'client/registerCapability') {

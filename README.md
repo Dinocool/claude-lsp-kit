@@ -7,7 +7,7 @@ large repos and starts separate servers for the git worktrees agents work in.
 ## What it fixes
 
 The language servers run behind one small stdio proxy
-(`plugins/lsp-kit/proxy.mjs`, no dependencies), which fixes three things.
+(`plugins/lsp-kit/proxy.mjs`, no dependencies), which fixes four things.
 
 **1. Whole-repo watcher fallbacks.** Claude Code's LSP client doesn't advertise
 `workspace.didChangeWatchedFiles`. Without it, `svelte-language-server` starts
@@ -19,11 +19,18 @@ reports file changes. It then watches each server's root itself with one
 native recursive `fs.watch`, skipping dot-directories, `node_modules` and
 `target`. Changes reach the server in batches.
 
-**2. Worktrees.** Agents edit code in git worktrees nested in the session
-directory. The proxy sends each file to a server rooted at its own git
-worktree: the nearest directory below the session root that holds a `.git`
-entry. An agent's hover, definitions and references therefore reflect its
-worktree's code, not main's. Limits:
+**2. Roots.** Claude Code roots its servers at the session's working
+directory, which can be a subdirectory of the repo. Project config sits at the
+repo root (`.luarc.json`, the Cargo workspace, `svelte.config.*`), and LuaLS
+reads `.luarc.json` only from its workspace root, so a session started in a
+subdirectory silently lost it. Every server is rooted at a git toplevel
+instead: the session's server at the toplevel of the session directory, and
+each file's server at the toplevel of the checkout that owns it.
+
+**3. Worktrees.** Agents edit code in linked git worktrees, nested in the
+session directory (`.claude/worktrees/<name>`) or beside it. A file in one goes
+to a server rooted at that worktree, so an agent's hover, definitions and
+references reflect its worktree's code, not main's. Limits:
 
 - worktree servers start on first use;
 - at most 3 run at once, and the least recently used one stops first;
@@ -31,8 +38,8 @@ worktree's code, not main's. Limits:
   deleted.
 
 `workspaceSymbol` queries every live server and merges the results, so a
-symbol shows up once per live worktree. Git submodules and nested clones are
-not worktrees and stay with the session's server. Servers run with the session
+symbol shows up once per live worktree. Git submodules belong to their
+superproject's server; a nested clone is its own checkout. Servers run with the session
 root as their working directory, so they never stop a worktree from being
 removed on Windows.
 
@@ -40,7 +47,7 @@ Recursive `fs.watch` is native and cheap on Windows and macOS. On Linux, Node
 20+ emulates it in JavaScript and watches every directory, which can hit
 inotify limits in very large trees.
 
-**3. Per-language setup.**
+**4. Per-language setup.**
 - **Rust:** rust-analyzer only looks for `Cargo.toml` at the root and one
   level down. The proxy finds the top-level `Cargo.toml` in every subtree and
   passes them all as `linkedProjects`, so crates like `tools/foo` or
@@ -49,7 +56,12 @@ inotify limits in very large trees.
 - **Svelte:** the server comes from the project's `node_modules` if it's
   there, otherwise from the global install next to `node`.
 - **Lua:** scope and runtime come from the project's `.luarc.json`. Without one
-  bounding the workspace, LuaLS scans every file under the root.
+  bounding the workspace, LuaLS scans every file under the root. LuaLS's
+  `documentSymbol` lists every local, parameter and `if` block of every
+  function (1,500 entries for a 1,900-line file); the proxy trims it to an
+  outline: functions, methods, file-level variables and table fields, plus
+  functions named inside function bodies, with their ranges.
+  `workspaceSymbol` is not trimmed, so it still finds locals by name.
 
 If a server isn't installed, `initialize` fails with a message that names it.
 
@@ -60,8 +72,10 @@ The plugin's hooks only add context and never block a tool call:
 - **SessionStart / SubagentStart:** lists the languages the LSP tool serves in
   this project, then explains when to use `documentSymbol`, `goToDefinition`,
   `findReferences`, `hover`, call hierarchy and `workspaceSymbol` instead of
-  Grep or whole-file Read. A language is listed only if its project marker is
-  present and its server is installed. Markers: `svelte.config.*`, a
+  Grep or whole-file Read, and for a large file to prefer `workspaceSymbol`
+  with a query or `findReferences` from a known line. A language is listed
+  only if its project marker is present at the repo root and its server is
+  installed. Markers: `svelte.config.*`, a
   `Cargo.toml`, `.luarc.json`.
 - **Grep:** when the pattern is a bare identifier searched over a served
   language, a hint to use `workspaceSymbol`, `findReferences` and
@@ -101,6 +115,10 @@ marketplace.
 - `node test/smoke.mjs <svelte|rust|lua> <root> <hover|references|documentSymbol|definition> <file:line:col>...`
   drives the proxy like Claude Code does.
 - `node test/hooks.mjs <root> [largeFile]` prints what the hooks would add.
+- `node test/lifecycle.mjs <scratchDir>` crashes and removes a worktree server.
+- `node test/roots.mjs <scratchDir>` checks a session started in a
+  subdirectory roots Lua at the git toplevel (`.luarc.json` applies), a
+  sibling worktree gets its own server, and the Lua outline.
 
 ## License
 
