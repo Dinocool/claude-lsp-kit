@@ -1,7 +1,4 @@
-// The languages lsp-kit serves. The proxy reads `server`, `languageId`,
-// `watch`, `initializationOptions` and `results` (per-method response
-// rewrites); the hooks read `name`, `extensions`, `note`, `present` and
-// `available`.
+// The languages lsp-kit serves; `results` holds per-method response rewrites.
 import { execFileSync } from 'node:child_process';
 import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { createRequire } from 'node:module';
@@ -132,7 +129,8 @@ export function cargoManifests(dir, max = Infinity, found = []) {
 // binary is the server itself.
 function rustAnalyzer(root) {
 	try {
-		return execFileSync('rustup', ['which', 'rust-analyzer'], { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+		// windowsHide: run from the console-less manager, it would flash a console window.
+		return execFileSync('rustup', ['which', 'rust-analyzer'], { cwd: root, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true }).trim();
 	} catch (e) {
 		if (e.code === 'ENOENT') return 'rust-analyzer';
 		throw new Error(`rustup which rust-analyzer failed: ${e.stderr?.trim() || e.message}`);

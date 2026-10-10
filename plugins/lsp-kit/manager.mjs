@@ -57,6 +57,7 @@
 import { spawn } from 'node:child_process';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, watch } from 'node:fs';
 import { connect, createServer } from 'node:net';
+import { createInterface } from 'node:readline';
 import { dirname, extname, isAbsolute, join, relative, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { LANGUAGES, gitRoot } from './languages.mjs';
@@ -69,6 +70,7 @@ import { endpoint, frame, readFrames } from './rpc.mjs';
 const MAX_SERVERS = Number(process.env.LSP_KIT_MAX_SERVERS) || 10;
 const IDLE_MS = Number(process.env.LSP_KIT_IDLE_MS) || 10 * 60 * 1000;
 const STOP_KILL_MS = 5000; // a stopping server that hasn't exited by then is killed
+const STDERR_LINE = 300; // a server's stderr line is logged up to this many characters
 const WATCHED_FILES = 'workspace/didChangeWatchedFiles';
 const FILE_CHANGE = { Created: 1, Changed: 2, Deleted: 3 };
 const CONTENT_MODIFIED = -32801;
@@ -93,9 +95,10 @@ let ids = 0;
 // to its stderr (Claude Code's LSP log).
 function log(line, only) {
 	const text = `lsp-kit: ${line}`;
-	appendFileSync(LOG, `${new Date().toISOString()} ${text}\n`);
+	logFile(text);
 	for (const s of only ? [only] : sessions) toSession(s, { jsonrpc: '2.0', method: 'lsp-kit/log', params: { line: text } });
 }
+const logFile = (text) => appendFileSync(LOG, `${new Date().toISOString()} ${text}\n`);
 // LSP_KIT_TRACE=1 logs every message's direction, server, method/id and error.
 const trace = process.env.LSP_KIT_TRACE
 	? (dir, no, msg) =>
@@ -103,7 +106,7 @@ const trace = process.env.LSP_KIT_TRACE
 	: () => {};
 
 process.on('uncaughtException', (e) => {
-	appendFileSync(LOG, `${new Date().toISOString()} lsp-kit: manager crashed: ${e.stack}\n`);
+	logFile(`lsp-kit: manager crashed: ${e.stack}`);
 	process.exit(1);
 });
 
@@ -138,8 +141,9 @@ function startServer(session, root, key, shareKey) {
 		const { command, args } = lang.server(root);
 		// cwd stays the manager's (the home directory): on Windows a process's cwd
 		// can't be deleted, which would block removing the worktree. Servers take
-		// their root from rootUri.
-		server.child = spawn(command, args, { stdio: ['pipe', 'pipe', 'ignore'] });
+		// their root from rootUri. windowsHide: the manager has no console, so
+		// without it each server would get a visible console window of its own.
+		server.child = spawn(command, args, { stdio: 'pipe', windowsHide: true });
 		server.child.on('error', (e) => (server.startError = e.message));
 		server.child.stdin.on('error', () => {}); // a write racing the child's exit; 'close' cleans up
 		server.child.on('close', (code) => serverClosed(server, code));
@@ -147,9 +151,13 @@ function startServer(session, root, key, shareKey) {
 			try {
 				fromServer(server, msg);
 			} catch (e) {
-				log(`${lang.name} server #${server.no}: dropped ${msg.method ?? `the answer to ${msg.id}`}: ${e.message}`);
+				log(`${lang.name} server #${server.no}: dropped ${msg?.method ?? `the answer to ${msg?.id}`}: ${e.message}`);
 			}
 		});
+		// Its stderr (rust-analyzer's panics) goes to the log file only, each line cut short.
+		createInterface({ input: server.child.stderr, crlfDelay: Infinity }).on('line', (line) =>
+			logFile(`lsp-kit: ${lang.name} server #${server.no} stderr: ${line.slice(0, STDERR_LINE)}`)
+		);
 	} catch (e) {
 		server.startError = e.message;
 		setImmediate(() => serverClosed(server));
@@ -304,19 +312,22 @@ const docKey = (uri) => {
 
 // ---- sessions -> servers ------------------------------------------------------
 
+// A connection becomes a session with its proxy's hello; until then it is
+// registered nowhere and gets no log lines (the pipe's default ACL lets other
+// local users connect).
 function attach(socket) {
 	const session = { no: ++sessionCount, socket, uses: new Map(), pending: new Map() }; // uses: server -> the session's spelling of its root
-	sessions.add(session);
 	socket.on('error', () => {}); // 'close' follows
 	socket.on('close', () => detach(session));
-	// A message the manager can't route (its checkout vanished mid-way) is
-	// answered with the reason; the manager keeps serving.
+	// A message the manager can't handle (malformed, or its checkout vanished
+	// mid-way) is answered with the reason; no client input stops the manager.
 	readFrames(socket, (msg) => {
 		try {
-			fromSession(session, msg);
+			if (session.lang) fromSession(session, msg);
+			else hello(session, msg);
 		} catch (e) {
-			log(`session #${session.no}: ${msg.method ?? 'response'} failed: ${e.message}`);
-			if (msg.method && msg.id != null) toSession(session, { jsonrpc: '2.0', id: msg.id, error: { code: -32603, message: `lsp-kit: ${e.message}` } });
+			log(`session #${session.no}: ${msg?.method ?? 'response'} failed: ${e.message}`);
+			if (msg?.method && msg.id != null) toSession(session, { jsonrpc: '2.0', id: msg.id, error: { code: -32603, message: `lsp-kit: ${e.message}` } });
 		}
 	});
 }
@@ -338,8 +349,16 @@ function detach(session) {
 
 // The proxy's first message. It carries the client's initialize params once
 // the client has sent them, so a manager started after that serves the session.
-function hello(session, { language, cwd, pid, initialize }) {
-	Object.assign(session, { language, lang: LANGUAGES[language], cwd });
+// Any other first message ends the connection with the reason.
+function hello(session, msg) {
+	const { language, cwd, pid, initialize } = (msg?.method === 'lsp-kit/hello' && msg.params) || {};
+	if (!Object.hasOwn(LANGUAGES, language)) {
+		toSession(session, { jsonrpc: '2.0', method: 'lsp-kit/log', params: { line: `lsp-kit: rejected: the first message must be a hello for one of ${Object.keys(LANGUAGES).join(', ')}` } });
+		session.socket.end();
+		return;
+	}
+	Object.assign(session, { language, lang: LANGUAGES[language], cwd: String(cwd) });
+	sessions.add(session);
 	log(`session #${session.no} (${session.lang.name}, pid ${pid}) joined manager pid ${process.pid}`, session);
 	if (initialize) begin(session, initialize);
 }
@@ -358,7 +377,6 @@ const docUri = (params) => params?.textDocument?.uri ?? params?.item?.uri;
 
 function fromSession(session, msg) {
 	trace('=>', `s${session.no}`, msg);
-	if (msg.method === 'lsp-kit/hello') return hello(session, msg.params);
 	if (msg.method === 'initialize') {
 		begin(session, msg.params);
 		const home = serverFor(session, session.root);
@@ -386,9 +404,9 @@ function fromSession(session, msg) {
 			// The session root's server (started if stopped) plus every other live one it has used.
 			const home = serverFor(session, session.root);
 			const asked = [...session.uses.keys()].filter((s) => s === home || s.ready);
-			Promise.all(asked.map((s) => request(s, msg.method, msg.params).then((a) => respellAll(a ?? [], s.root, session.uses.get(s) ?? s.root)))).then((answers) =>
-				answer(session, msg.id, home, answers.flat())
-			);
+			Promise.all(asked.map((s) => request(s, msg.method, msg.params).then((a) => respellAll(a ?? [], s.root, session.uses.get(s) ?? s.root))))
+				.then((answers) => answer(session, msg.id, home, answers.flat()))
+				.catch((e) => toSession(session, { jsonrpc: '2.0', id: msg.id, error: { code: -32603, message: `lsp-kit: ${e.message}` } }));
 		} else if (msg.method === 'workspace/didChangeConfiguration') for (const s of session.uses.keys()) send(s, msg);
 		else route(session, serverFor(session, session.root), msg, session.root);
 		return;

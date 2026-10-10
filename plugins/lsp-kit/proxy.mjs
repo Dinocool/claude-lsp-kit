@@ -2,8 +2,8 @@
 //   node proxy.mjs <language>   (a key of LANGUAGES)
 // It forwards the session's LSP traffic to the machine-wide manager
 // (manager.mjs), which runs ONE server per checkout for every session. If no
-// manager answers on the endpoint (rpc.mjs), the proxy starts one detached and
-// connects; the pipe admits one listener, so racing proxies end up on one
+// manager answers on the endpoint (rpc.mjs), the proxy starts one (launch.mjs)
+// and connects; the pipe admits one listener, so racing proxies end up on one
 // manager. If the manager exits, requests it hadn't answered fail with that
 // reason, and the next message reconnects (starting a new manager) and replays
 // the session's `initialize` params in the hello. A manager that can't be
@@ -19,7 +19,7 @@ import { endpoint, frame, readFrames } from './rpc.mjs';
 if (!LANGUAGES[process.argv[2]]) throw new Error(`lsp-kit: unknown language "${process.argv[2]}"`);
 const CONNECT_MS = 10 * 1000; // a manager it started gets this long to listen
 const { path, log } = endpoint();
-const manager = fileURLToPath(new URL('./manager.mjs', import.meta.url));
+const launcher = fileURLToPath(new URL('./launch.mjs', import.meta.url)); // starts the manager with no live parent
 let init = null; // the client's initialize params, replayed to every new manager
 let shutdownReceived = false;
 let link = null; // the manager connection: a promise of the socket while connecting or connected
@@ -48,7 +48,7 @@ process.stdin.on('end', exit);
 async function open() {
 	let socket = await tryConnect();
 	if (!socket) {
-		spawn(process.execPath, [manager], { detached: true, stdio: 'ignore', windowsHide: true, cwd: homedir() }).unref();
+		spawn(process.execPath, [launcher], { stdio: 'ignore', windowsHide: true, cwd: homedir() }).unref();
 		for (const end = Date.now() + CONNECT_MS; !socket && Date.now() < end; ) {
 			await new Promise((r) => setTimeout(r, 100));
 			socket = await tryConnect();

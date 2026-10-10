@@ -1,7 +1,7 @@
 // The tests' LSP client: drives the proxy like Claude Code does (capabilities {},
 // every server->client request answered null) and keeps the lsp-kit log lines
 // the proxy relays from its manager.
-import { execSync, spawn } from 'node:child_process';
+import { execFileSync, execSync, spawn } from 'node:child_process';
 import { readlinkSync } from 'node:fs';
 import { basename } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -47,6 +47,25 @@ export const managerProcesses = () =>
 		.split('\n')
 		.filter((l) => l.includes(managerScript))
 		.map((l) => Number(l.trim().split(' ')[0]));
+// Windows: 'visible' when the process's console window shows on screen, else
+// 'hidden' (a console without a shown window) or 'none'; 'none' elsewhere. The
+// probe leaves its own console and attaches to the process's (kernel32
+// FreeConsole, AttachConsole, GetConsoleWindow; user32 IsWindowVisible).
+export function consoleWindow(pid) {
+	if (process.platform !== 'win32') return 'none';
+	const script = [
+		"Add-Type -Name C -Namespace Probe -MemberDefinition '",
+		'[DllImport("kernel32.dll")] public static extern bool FreeConsole();',
+		'[DllImport("kernel32.dll")] public static extern bool AttachConsole(uint pid);',
+		'[DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();',
+		"[DllImport(\"user32.dll\")] public static extern bool IsWindowVisible(IntPtr hwnd);';",
+		'[void][Probe.C]::FreeConsole();',
+		`if (-not [Probe.C]::AttachConsole(${pid})) { 'none'; exit }`,
+		'$h = [Probe.C]::GetConsoleWindow();',
+		"if ($h -ne [IntPtr]::Zero -and [Probe.C]::IsWindowVisible($h)) { 'visible' } else { 'hidden' }"
+	].join('\n');
+	return execFileSync('powershell', ['-NoProfile', '-Command', script], { encoding: 'utf8', windowsHide: true }).trim();
+}
 export const processPath = (pid) =>
 	process.platform === 'win32'
 		? execSync(`powershell -NoProfile -Command "(Get-Process -Id ${pid}).Path"`).toString().trim()

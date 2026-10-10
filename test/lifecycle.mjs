@@ -10,7 +10,7 @@ import { execSync } from 'node:child_process';
 import { existsSync, mkdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { alive, check, finish, killManager, log, privatePipe, startProxy, wait } from './client.mjs';
+import { alive, check, consoleWindow, finish, killManager, log, privatePipe, startProxy, wait } from './client.mjs';
 
 const base = process.argv[2];
 rmSync(base, { recursive: true, force: true });
@@ -45,6 +45,8 @@ const a = startProxy('lua', repo);
 await a.initialize(repo);
 check((await refs(a, repo)) === '3 refs', 'main checkout answers');
 check((await refs(a, wt)) === '3 refs', 'worktree answers');
+const consoles = [a.manager, a.pidFor(repo), a.pidFor(wt)].map((pid) => `${pid} ${consoleWindow(pid)}`);
+check(!consoles.some((c) => c.endsWith('visible')), `no console window shows for the manager or its servers (${consoles.join(', ')})`);
 
 const wtPid = a.pidFor(wt);
 process.kill(wtPid);

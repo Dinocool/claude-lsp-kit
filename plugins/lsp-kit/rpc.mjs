@@ -58,9 +58,6 @@ const protocol = () => {
 export function endpoint() {
 	const name = process.env.LSP_KIT_PIPE || `lsp-kit-${userInfo().username}-p${protocol()}`;
 	const dir = process.env.CLAUDE_PLUGIN_DATA || tmpdir();
-	return {
-		dir,
-		path: process.platform === 'win32' ? `\\\\.\\pipe\\${name}` : join(dir, `${name}.sock`),
-		log: join(dir, `${name}.log`)
-	};
+	return { dir, path: pipePath(name, dir), log: join(dir, `${name}.log`) };
 }
+export const pipePath = (name, dir) => (process.platform === 'win32' ? `\\\\.\\pipe\\${name}` : join(dir, `${name}.sock`));

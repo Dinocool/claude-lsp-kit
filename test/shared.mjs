@@ -3,12 +3,15 @@
 // the last session closes it or disconnects; diagnostics reach every session
 // with the document open, each in its own spelling of the checkout; a killed
 // manager is replaced on the next request; proxies starting at the same
-// instant end up on one manager.
+// instant end up on one manager; a connection without a valid hello is turned
+// away; the manager survives a tree kill of the proxy that started it.
 // Usage: node test/shared.mjs <scratchDir>   (needs lua-language-server and git)
 import { execSync } from 'node:child_process';
 import { mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { connect } from 'node:net';
 import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { pipePath, readFrames } from '../plugins/lsp-kit/rpc.mjs';
 import { alive, check, finish, killManager, log, managerProcesses, privatePipe, startProxy, wait } from './client.mjs';
 
 rmSync(process.argv[2], { recursive: true, force: true });
@@ -100,6 +103,36 @@ check((await refs(a, repo)).startsWith('3 refs') && alive(serverPid) && starts()
 a.notify('textDocument/didClose', { textDocument: { uri: aUri } });
 check(await until(() => closesSent('a.lua') === 1, 5000), "a's didClose, the last holder's, closes the document");
 
+// ---- connections that don't open with a valid hello -------------------------------
+// Each gets the reason and is closed, sees no other log line, and the manager keeps serving.
+const raw = (body) =>
+	new Promise((resolve) => {
+		const socket = connect(pipePath(shared.LSP_KIT_PIPE, data));
+		const lines = [];
+		readFrames(socket, (m) => lines.push(m.params?.line ?? JSON.stringify(m)));
+		socket.on('error', () => {});
+		socket.on('close', () => resolve(lines));
+		socket.on('connect', () => socket.write(`Content-Length: ${Buffer.byteLength(body)}\r\n\r\n${body}`));
+		setTimeout(() => socket.destroy(), 5000);
+	});
+for (const [what, body] of [
+	['an unknown language', JSON.stringify({ jsonrpc: '2.0', method: 'lsp-kit/hello', params: { language: '__proto__' } })],
+	['no hello params', JSON.stringify({ jsonrpc: '2.0', method: 'lsp-kit/hello' })],
+	['a null message', 'null'],
+	['a request instead of a hello', JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: {} })]
+]) {
+	const lines = await raw(body);
+	check(lines.length === 1 && /rejected: the first message must be a hello/.test(lines[0]), `${what}: the connection gets only the reason and is closed (${JSON.stringify(lines)})`);
+}
+check(alive(a.manager) && (await refs(a, repo)).startsWith('3 refs'), 'the manager keeps serving session a');
+// A connection that hasn't said hello hears nothing, not even a server's crash and restart.
+const silent = raw('');
+const crashed = a.pidFor(repo);
+process.kill(crashed);
+await wait(1500);
+check((await refs(a, repo)).startsWith('3 refs') && a.pidFor(repo) !== crashed, `session a answers after its server (pid ${crashed}) was killed`);
+check((await silent).length === 0, 'a connection without a hello got no log line');
+
 // ---- the manager is killed ---------------------------------------------------------
 const c = startProxy('lua', link, { ...shared, name: 'c' });
 await c.initialize(link);
@@ -125,4 +158,20 @@ const running = managerProcesses();
 check(running.length === 1 && pids.has(running[0]), `and one manager process runs: ${running.join(', ')}`);
 log(`managers of this test: ${running.join(', ')}`);
 await Promise.all(racers.map((r) => r.close()));
+
+// ---- a tree kill of the proxy that started the manager (Windows) ---------------------
+// Claude Code may end a session's process tree; the manager every session shares must survive it.
+if (process.platform === 'win32') {
+	const tree = { LSP_KIT_PIPE: privatePipe() };
+	const starter = startProxy('lua', repo, { ...tree, name: 'starter' });
+	await starter.initialize(repo);
+	const other = startProxy('lua', repo, { ...tree, name: 'other' });
+	await other.initialize(repo);
+	execSync(`taskkill /T /F /PID ${starter.proxy.pid}`, { stdio: 'pipe' });
+	await starter.exited;
+	await wait(500);
+	check(alive(starter.manager), `taskkill /T /F of the proxy that started it leaves the manager (pid ${starter.manager}) running`);
+	check((await refs(other, repo)).startsWith('3 refs') && other.manager === starter.manager, 'and serving the other session');
+	await other.close();
+}
 finish();

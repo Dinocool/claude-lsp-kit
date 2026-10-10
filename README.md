@@ -56,8 +56,9 @@ junctions); each session only ever sees its own spelling.
 
 ### Lifecycle
 
-- The first session to need a language server starts the manager, detached.
-  It listens on the named pipe `\\.\pipe\lsp-kit-<user>-p<version>` (a Unix
+- The first session to need a language server starts the manager through a
+  launcher that exits at once, so ending that session's process tree
+  (`taskkill /T`) leaves the manager running for everyone. It listens on the named pipe `\\.\pipe\lsp-kit-<user>-p<version>` (a Unix
   socket in the plugin data directory elsewhere). Only one process can own
   it, so sessions starting together end up on one manager. `<version>` is a
   digest of the manager's code: after an update that changes it, new sessions
@@ -163,8 +164,12 @@ started with, and with it its manager.
 
 - The manager logs to `lsp-kit-<user>-p<version>.log` in the plugin data
   directory (`~/.claude/plugins/data/<plugin id>/`), and each session's proxy
-  writes the same lines to its stderr (Claude Code's LSP log). The log of the
+  writes the same lines to its stderr (Claude Code's LSP log). Each server's
+  own stderr (a rust-analyzer panic, say) goes to the log file only, as
+  `<Lang> server #n stderr:` lines cut at 300 characters. The log of the
   manager before it is kept as `.previous.log`, a crash's stack included.
+  Connections that don't open with a valid hello are turned away and see no
+  log lines.
 - Start and stop events are always logged, as `lsp-kit: <Lang> server #n for
   <root> (<n> live, pid <pid>)`, and each session's start as `session #n
   (<Lang>, pid <proxy pid>) joined manager pid <pid>`.
@@ -185,10 +190,13 @@ started with, and with it its manager.
 - `node test/shared.mjs <scratchDir>` checks two sessions on one checkout
   share one server and each sees its own spelling of it. It checks documents
   stay open until the last session closes them or its proxy is killed, and
-  diagnostics reach both sessions. A killed manager is replaced on the next
-  request, and proxies starting together end up on one manager.
+  diagnostics reach both sessions. Connections without a valid hello are
+  turned away and hear nothing. A killed manager is replaced on the next
+  request, proxies starting together end up on one manager, and on Windows
+  the manager survives `taskkill /T` of the proxy that started it.
 - `node test/lifecycle.mjs <scratchDir>` kills the session's and a
   worktree's server, and removes a worktree while its server runs. It checks
+  no console window shows for the manager or its servers (Windows), that
   killing the manager stops every server, and the machine-wide cap across
   two sessions (least recently used first, never one with a request in
   flight). The session's server stops when idle (one server per checkout
