@@ -157,9 +157,9 @@ listener.listen(PIPE, () => {
 // (at each server start and measurement, until the process is gone), and the
 // next manager to start stops the recorded processes of managers that are
 // gone, with their descendants.
-// - A manager is gone when its pipe doesn't answer, or is this manager's own
-//   (a pipe has one listener). That needs no clock: a start time read back
-//   from `ps` moves with a clock step, and would make a live manager look gone.
+// - A manager is gone when its pipe doesn't answer (see `gone`). That needs
+//   no clock: a start time read back from `ps` moves with a clock step, and
+//   would make a live manager look gone.
 // - A process is lsp-kit's only by its pid AND creation time, both from one
 //   listing: a process that reused the pid, or one lsp-kit didn't start
 //   (another editor's rust-analyzer), is never touched. A marker in each
@@ -208,20 +208,28 @@ const answers = (pipe) =>
 		probe.once('connect', () => (probe.destroy(), resolve(true)));
 		probe.once('error', (e) => resolve(e.code !== 'ENOENT' && e.code !== 'ECONNREFUSED')); // anything else: not known gone
 	});
+// A named pipe has one listener, so on Windows a record naming this manager's
+// pipe is a gone predecessor's. A Unix socket path can have two listeners (two
+// managers racing past a stale socket), so there it is probed like any other.
+const gone = async (rec) => (process.platform === 'win32' && rec.pipe === PIPE) || !(await answers(rec.pipe));
 
+// The process list is read after every pipe check, so a slow probe can't leave
+// the kills matching a stale list.
 async function sweep() {
-	const list = await processes();
+	const records = [];
 	for (const file of readdirSync(dir).filter((f) => f.startsWith(RECORDS) && f.endsWith('.json') && join(dir, f) !== RECORD)) {
-		const path = join(dir, file);
-		let rec;
 		try {
-			rec = JSON.parse(readFileSync(path, 'utf8'));
+			const rec = JSON.parse(readFileSync(join(dir, file), 'utf8'));
 			if (typeof rec.pipe !== 'string' || !Array.isArray(rec.processes)) throw new Error('not a server record');
+			records.push({ file, rec });
 		} catch (e) {
 			log(`server record ${file} unreadable, left in place: ${e.message}`);
-			continue;
 		}
-		if (rec.pipe !== PIPE && (await answers(rec.pipe))) continue; // its manager runs
+	}
+	const dead = (await Promise.all(records.map(async (r) => ((await gone(r.rec)) ? r : null)))).filter(Boolean);
+	if (!dead.length) return;
+	const list = await processes();
+	for (const { file, rec } of dead) {
 		const left = new Map(); // server pid -> { lang, root, pids }
 		for (const p of rec.processes.filter((p) => sameProcess(list, p))) {
 			if (!left.has(p.server)) left.set(p.server, { lang: p.lang, root: p.root, pids: new Set() });
@@ -236,7 +244,7 @@ async function sweep() {
 			log(`stopped what was left of a ${lang} server for ${root} (server pid ${server}): pids ${[...pids].join(', ')}; its manager pid ${rec.pid} is gone`);
 		}
 		try {
-			rmSync(path, { force: true });
+			rmSync(join(dir, file), { force: true });
 		} catch (e) {
 			log(`server record ${file} not removed: ${e.message}`);
 		}

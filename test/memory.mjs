@@ -87,7 +87,7 @@ const helperPid = Number(/Svelte server #\d+ stderr: helper pid (\d+)/.exec(mana
 const recorded = (pipe, pids) => pids.every((pid) => recordOf(pipe) && readFileSync(join(data, recordOf(pipe)), 'utf8').includes(`"pid":${pid},`));
 check(recorded(limited.LSP_KIT_PIPE, [stubPid, helperPid]), `the manager recorded the stub (pid ${stubPid}) and its helper (pid ${helperPid})`);
 
-// A live manager whose record names a gone manager's pid: liveness is its pipe answering.
+// A live manager: its pipe answers, so the next manager's sweep leaves its record and servers alone.
 const liveEnv = { LSP_KIT_PIPE: privatePipe() };
 const live = startProxy('lua', repo, { ...liveEnv, name: 'live' });
 await live.initialize(repo);
@@ -95,7 +95,6 @@ check((await refs(live, repo)) === '3 refs', 'a live manager serves the main che
 const livePid = live.pidFor(repo);
 check(await until(() => recorded(liveEnv.LSP_KIT_PIPE, [livePid]), 10000), `it recorded its server (pid ${livePid}) at the start`);
 const liveRecord = join(data, recordOf(liveEnv.LSP_KIT_PIPE));
-writeFileSync(liveRecord, JSON.stringify({ ...JSON.parse(readFileSync(liveRecord, 'utf8')), pid: svelte.manager }));
 
 // A look-alike: the same program, started outside lsp-kit by a parent that has
 // exited. A forged record of a gone manager names its pid with another start time.
@@ -119,9 +118,16 @@ check(
 	swept?.[1] === repo && Number(swept[2]) === stubPid && swept[3].split(', ').includes(String(helperPid)) && Number(swept[4]) === svelte.manager,
 	`it logs the stop with the pids, language and why: ${swept?.[0]}`
 );
-check(alive(lookAlike) && !existsSync(join(data, `${RECORDS}forged.json`)), `the look-alike lsp-kit didn't start (pid ${lookAlike}) still runs, though a gone manager's record names its pid`);
-check(alive(livePid) && existsSync(liveRecord), `the live manager's server (pid ${livePid}) still runs and its record stays, though the record names a gone pid`);
-process.kill(lookAlike);
+const forgedPath = join(data, `${RECORDS}forged.json`);
+check(await until(() => !existsSync(forgedPath), 15000), "the sweep finishes: the gone manager's forged record is removed");
+check(alive(lookAlike), `the look-alike lsp-kit didn't start (pid ${lookAlike}) still runs, though a gone manager's record names its pid`);
+check(alive(livePid) && existsSync(liveRecord), `the live manager's server (pid ${livePid}) still runs and its record stays`);
+const stop = (pid) => {
+	try {
+		process.kill(pid);
+	} catch {} // already gone
+};
+stop(lookAlike);
 await later.close();
 
 // A record that can't be written (no file may be created in the data folder) is
@@ -142,5 +148,5 @@ check(/servers not recorded \(retried at the next measurement\): /.test(managerL
 check(served === '3 refs' && (await refs(live, repo)) === '3 refs' && alive(live.manager), `the manager (pid ${live.manager}) goes on serving: ${served}`);
 await live.close();
 check(await until(() => ![stubPid, helperPid, lookAlike].some(alive), 5000), 'no stub process is left running');
-for (const pid of [stubPid, helperPid, lookAlike].filter(alive)) process.kill(pid); // after a failure above
+[stubPid, helperPid, lookAlike].forEach(stop); // after a failure above
 finish();

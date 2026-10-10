@@ -356,8 +356,7 @@ started with, and with it its manager.
   (and the stub, off Windows) outlives it. The next manager's start stops
   them and logs it. A look-alike lsp-kit didn't start, the same program also
   without a live parent, keeps running, even with a gone manager's record
-  naming its pid. So does a live manager's server whose record names a gone
-  pid. With file creation denied in the data folder, the failed record write
+  naming its pid. So does a live manager's server and its record. With file creation denied in the data folder, the failed record write
   is logged and the manager goes on serving.
 - `node test/typescript.mjs <scratchDir>` installs TypeScript 7 into its
   project (npm, so the first run needs the registry or npm's cache). It checks
