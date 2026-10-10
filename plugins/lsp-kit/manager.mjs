@@ -79,6 +79,7 @@ const RETRY_WINDOW_MS = 55 * 1000; // under Claude Code's 60 s request timeout
 const DID_OPEN = 'textDocument/didOpen';
 const DID_CHANGE = 'textDocument/didChange';
 const DID_CLOSE = 'textDocument/didClose';
+const PUBLISH = 'textDocument/publishDiagnostics';
 
 const { dir, path: PIPE, log: LOG } = endpoint();
 const servers = new Map(); // share key -> live server
@@ -173,9 +174,11 @@ function startServer(session, root, key, shareKey) {
 	params.capabilities ??= {};
 	params.capabilities.workspace ??= {};
 	params.capabilities.workspace.didChangeWatchedFiles = { dynamicRegistration: true };
+	params.capabilities.workspace.diagnostics = { refreshSupport: true }; // see sendDoc
 	params.initializationOptions = { ...lang.initializationOptions?.(root), ...params.initializationOptions };
 	server.initialized = request(server, 'initialize', params, true).then((result) => {
 		if (server.closed) return;
+		server.pullsDiagnostics = !!result?.capabilities?.diagnosticProvider; // see sendDoc
 		write(server, { jsonrpc: '2.0', method: 'initialized', params: {} });
 		server.ready = true;
 		for (const msg of server.queue.splice(0)) write(server, msg);
@@ -424,11 +427,11 @@ function fromSession(session, msg) {
 	if (msg.method === DID_CLOSE) return closeDoc(server, key, session);
 	if (!doc && msg.method === DID_OPEN) {
 		server.docs.set(key, { uri: serverUri, holders: new Set([session]), owner: session, version });
-		return send(server, msg);
+		return sendDoc(server, msg);
 	}
 	if (msg.method === DID_CHANGE && doc?.owner === session) {
 		doc.version = version;
-		return send(server, msg);
+		return sendDoc(server, msg);
 	}
 	const sync = msg.method === DID_OPEN || msg.method === DID_CHANGE;
 	// The server's copy isn't this session's (or the server lacks the document):
@@ -452,11 +455,28 @@ function syncFromDisk(server, key, uri, version, session) {
 	const doc = server.docs.get(key);
 	if (!doc) {
 		server.docs.set(key, { uri, holders: new Set([session]), owner: null, version });
-		return send(server, { jsonrpc: '2.0', method: DID_OPEN, params: { textDocument: { uri, languageId: server.lang.languageId, version, text } } });
+		return sendDoc(server, { jsonrpc: '2.0', method: DID_OPEN, params: { textDocument: { uri, languageId: server.lang.extensionToLanguage[extname(uri)], version, text } } });
 	}
 	doc.holders.add(session);
 	doc.owner = null;
-	send(server, { jsonrpc: '2.0', method: DID_CHANGE, params: { textDocument: { uri: doc.uri, version: ++doc.version }, contentChanges: [{ text }] } });
+	sendDoc(server, { jsonrpc: '2.0', method: DID_CHANGE, params: { textDocument: { uri: doc.uri, version: ++doc.version }, contentChanges: [{ text }] } });
+}
+
+// A didOpen or didChange to the server, then its diagnostics pulled if it
+// serves them that way. LSP 3.17 "Pull Diagnostics": a server advertising
+// `diagnosticProvider` may answer only `textDocument/diagnostic` (TypeScript 7
+// does), but Claude Code's client takes only pushed `publishDiagnostics`. The
+// manager pulls after each change it sends and on `workspace/diagnostic/refresh`,
+// and passes the report on as a push.
+function sendDoc(server, msg) {
+	send(server, msg);
+	server.initialized.then(() => pullDiagnostics(server, docUri(msg.params)));
+}
+function pullDiagnostics(server, uri) {
+	if (!server.pullsDiagnostics) return;
+	request(server, 'textDocument/diagnostic', { textDocument: { uri } }).then((report) => {
+		if (report?.kind === 'full' && server.docs.has(docKey(uri))) fromServer(server, { jsonrpc: '2.0', method: PUBLISH, params: { uri, diagnostics: report.items } });
+	});
 }
 
 // The session no longer holds the document; the last holder's close reaches the server.
@@ -496,7 +516,8 @@ function settle(entry, reply) {
 // Server->client requests, answered here: no default (null) is wrong for these.
 const SERVER_REQUESTS = {
 	'workspace/configuration': (params) => params.items.map(() => null), // one null per item: "can't provide"
-	'workspace/workspaceFolders': (params, server) => [{ uri: pathToFileURL(server.root).href, name: server.root.split(sep).pop() }]
+	'workspace/workspaceFolders': (params, server) => [{ uri: pathToFileURL(server.root).href, name: server.root.split(sep).pop() }],
+	'workspace/diagnostic/refresh': (params, server) => void [...server.docs.values()].forEach((doc) => pullDiagnostics(server, doc.uri))
 };
 
 function fromServer(server, msg) {
@@ -527,7 +548,7 @@ function fromServer(server, msg) {
 	if (msg.id != null) return write(server, { jsonrpc: '2.0', id: msg.id, result: SERVER_REQUESTS[msg.method]?.(msg.params, server) ?? null });
 	// Progress tokens are the manager's (it answered window/workDoneProgress/create).
 	if (msg.method === '$/progress') return;
-	const doc = msg.method === 'textDocument/publishDiagnostics' && server.docs.get(docKey(msg.params.uri));
+	const doc = msg.method === PUBLISH && server.docs.get(docKey(msg.params.uri));
 	const to = doc ? doc.holders : [...sessions].filter((s) => s.uses.has(server));
 	for (const s of to) toSession(s, respellAll(msg, server.root, s.uses.get(server) ?? server.root));
 }

@@ -14,13 +14,16 @@ import { LANGUAGES, gitRoot } from '../languages.mjs';
 const LARGE_FILE_LINES = 150;
 const LARGE_FILE_TIP = 'for a large file, workspaceSymbol with a query, or findReferences from a known line, is more direct than its whole outline';
 const IDENTIFIER = /^(\\b)?[A-Za-z_$][\w$]*(\\b)?$/;
-// Grep glob/type words per language; an unscoped Grep matches every language.
-const SCOPE = { svelte: /svelte|\b[cm]?[jt]sx?\b|\{[^}]*\b[jt]s\b/, rust: /\brs\b|rust/, lua: /\blua\b/ };
+// A Grep glob or type names a language by its key or one of its extensions
+// (`*.{ts,mjs}`, type `rust`); an unscoped Grep matches every language.
+const SCOPE = Object.fromEntries(
+	Object.entries(LANGUAGES).map(([k, l]) => [k, new RegExp(`\\b(${[k, ...Object.keys(l.extensionToLanguage).map((e) => e.slice(1))].join('|')})\\b`)])
+);
 
 let input, root;
 const served = (keys) => keys.map((k) => LANGUAGES[k]).filter((l) => l.present(root) && l.available(root));
 // The languages serving a file, by its extension (none for a file lsp-kit doesn't serve).
-const languagesOf = (file) => Object.keys(LANGUAGES).filter((k) => LANGUAGES[k].extensions.includes(extname(file)));
+const languagesOf = (file) => Object.keys(LANGUAGES).filter((k) => Object.hasOwn(LANGUAGES[k].extensionToLanguage, extname(file)));
 
 // A hint is optional: any failure (odd input, unreadable file) means no hint, never an error.
 try {
@@ -35,7 +38,7 @@ try {
 function sessionNote() {
 	const langs = served(Object.keys(LANGUAGES));
 	if (!langs.length) return null;
-	const list = langs.map((l) => `${l.name} (${l.extensions.join(', ')}; ${l.note})`).join('; ');
+	const list = langs.map((l) => `${l.name} (${Object.keys(l.extensionToLanguage).join(', ')}; ${l.note})`).join('; ');
 	return (
 		'The LSP tool is deferred: load it once with ToolSearch query "select:LSP" before your first code lookup. ' +
 		`The LSP tool serves this project's ${list}. Use it for code navigation instead of Grep or whole-file Read: ` +

@@ -2,14 +2,14 @@
 	"name": "claude-lsp-kit",
 	"owner": { "name": "Dinocool", "url": "https://github.com/Dinocool" },
 	"metadata": {
-		"description": "Svelte, Rust and Lua language servers for Claude Code that stay responsive in large repos and follow agents into git worktrees."
+		"description": "Svelte, TypeScript/JavaScript, Rust and Lua language servers for Claude Code that stay responsive in large repos and follow agents into git worktrees."
 	},
 	"plugins": [
 		{
 			"name": "lsp-kit",
 			"source": "./plugins/lsp-kit",
-			"description": "Svelte, Rust and Lua LSP behind one machine-wide manager: native file watching, one bounded server per git worktree shared by every session, nested Cargo crates linked; hooks advertise the LSP and steer symbol work to it.",
-			"version": "3.0.0",
+			"description": "Svelte, TypeScript/JavaScript, Rust and Lua LSP behind one machine-wide manager: native file watching, one bounded server per git worktree shared by every session, nested Cargo crates linked; hooks advertise the LSP and steer symbol work to it.",
+			"version": "3.1.0",
 			"category": "development"
 		}
 	]

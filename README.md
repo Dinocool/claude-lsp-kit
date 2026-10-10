@@ -1,9 +1,16 @@
 # claude-lsp-kit
 
 A [Claude Code](https://claude.com/claude-code) plugin that gives the LSP tool
-**Svelte**, **Rust** and **Lua** language servers. It keeps them responsive in
+**Svelte**, **TypeScript and JavaScript**, **Rust** and **Lua** language servers. It keeps them responsive in
 large repos, starts separate servers for the git worktrees agents work in, and
 shares each server among all sessions on the machine.
+
+| Language | Extensions | Server | Served when the repo root has |
+|---|---|---|---|
+| Svelte | `.svelte` | svelte-language-server | `svelte.config.*` |
+| TypeScript and JavaScript | `.ts .mts .cts .tsx .js .mjs .cjs .jsx` | TypeScript 7 (`tsc --lsp`) | `tsconfig.json`, `jsconfig.json` or `package.json` |
+| Rust | `.rs` | rust-analyzer | a `Cargo.toml` (any depth) |
+| Lua | `.lua` | lua-language-server | `.luarc.json` |
 
 ## What it fixes
 
@@ -49,7 +56,12 @@ junctions); each session only ever sees its own spelling.
 - A document stays open on a shared server until the last session that
   opened it closes it or ends. When a second session opens or changes a
   document, the server reloads it from disk.
-- Diagnostics go to every session with the document open.
+- Diagnostics go to every session with the document open. Claude Code's
+  client only takes pushed diagnostics (`textDocument/publishDiagnostics`).
+  A server that advertises pull diagnostics (LSP 3.17 `diagnosticProvider`;
+  TypeScript 7 serves no others) is asked with `textDocument/diagnostic`
+  after every open or change and on its `workspace/diagnostic/refresh`. Its
+  report reaches the sessions as a push.
 - `workspaceSymbol` asks the session checkout's server (starting it if it
   stopped) and every other running server the session has used, and merges
   the results.
@@ -80,9 +92,15 @@ junctions); each session only ever sees its own spelling.
   There is no per-session fallback.
 - The manager runs with the environment of the session that started it.
 
-Recursive `fs.watch` is native and cheap on Windows and macOS. On Linux, Node
-20+ emulates it in JavaScript and watches every directory, which can hit
-inotify limits in very large trees.
+### Limits
+
+- Recursive `fs.watch` is native and cheap on Windows and macOS. On Linux,
+  Node 20+ emulates it in JavaScript and watches every directory, which can
+  hit inotify limits in very large trees.
+- Memory per server grows with the checkout. Measured: rust-analyzer about
+  3.5 GB, LuaLS about 1.4 GB, TypeScript 7 about 0.4 GB on a mid-sized
+  SvelteKit repo with a few files open (more for each project it loads). The
+  cap counts servers, not memory.
 
 **5. Per-language setup.**
 - **Rust:** rust-analyzer only looks for `Cargo.toml` at the root and one
@@ -96,6 +114,30 @@ inotify limits in very large trees.
   that runs the real server as its child, which stopping it could orphan.
 - **Svelte:** the server comes from the project's `node_modules` if it's
   there, otherwise from the global install next to `node`.
+- **TypeScript and JavaScript:** one TypeScript 7 server per checkout serves
+  every `.ts`/`.js` flavour. TypeScript 7 (July 2026) is the native port and
+  ships its own LSP server; Microsoft's
+  [announcement](https://devblogs.microsoft.com/typescript/announcing-typescript-7-0/)
+  says it "should work great in any editor". It has no `tsserver`, so the
+  tsserver wrappers can't serve a TypeScript 7 project. That includes
+  [typescript-language-server](https://github.com/typescript-language-server/typescript-language-server),
+  whose README expects TypeScript 7 to supersede it, and
+  [vtsls](https://github.com/yioneko/vtsls), last released December 2025 and
+  self-described as best-effort. The server is the first TypeScript 7 or newer
+  found in the project's `node_modules`, then in the global install next to
+  `node`. A project still on TypeScript 6 (Svelte's tooling needs it) is
+  served by the global one. lsp-kit starts the native binary from
+  `@typescript/typescript-<platform>-<arch>` directly, because the `tsc` bin
+  is a node wrapper that runs it as a child.
+  - **Boundary with Svelte:** `.svelte` files stay with the Svelte server,
+    and TypeScript 7 can't see inside them (that needs a tsserver plugin). So
+    `findReferences` from a `.ts` symbol misses its uses in `.svelte` files,
+    and `goToDefinition` on a component import in a `.ts` file lands on the
+    ambient `*.svelte` module. Ask the Svelte server, from a `.svelte` file,
+    for those.
+  - **Files outside every tsconfig** (a `scripts/` folder the tsconfig doesn't
+    include, say) each get an inferred project. References from a project
+    file reach them only once they are open.
 - **Lua:** scope and runtime come from the project's `.luarc.json`. Without one
   bounding the workspace, LuaLS scans every file under the root. LuaLS's
   `documentSymbol` lists every local, parameter and `if` block of every
@@ -117,12 +159,13 @@ The plugin's hooks only add context and never block a tool call:
   `findReferences`, `hover`, call hierarchy and `workspaceSymbol` instead of
   Grep or whole-file Read, and for a large file to prefer `workspaceSymbol`
   with a query or `findReferences` from a known line. A language is listed
-  only if its project marker is present at the repo root and its server is
-  installed. Markers: `svelte.config.*`, a
-  `Cargo.toml`, `.luarc.json`.
+  only if its project marker (in the table above) is present at the repo
+  root and its server is installed.
 - **Grep:** when the pattern is a bare identifier searched over a served
-  language, a hint to use `workspaceSymbol` and `findReferences`. A Grep of
-  one file gets the hint only when that file's language is served.
+  language, a hint to use `workspaceSymbol` and `findReferences`. A glob or
+  type names a language by its name or one of its extensions (`*.{ts,mjs}`,
+  type `rust`). A Grep of one file gets the hint only when that file's
+  language is served.
 - **Read:** when Claude reads a file over 150 lines in a served language in
   full, a hint to get the outline with `documentSymbol` first.
 
@@ -134,6 +177,7 @@ Install the language servers you need:
 
 ```sh
 npm install -g svelte-language-server   # Svelte
+npm install -g typescript@7             # TypeScript and JavaScript (unless the project has TypeScript 7 itself)
 rustup component add rust-analyzer      # Rust
 # Lua: lua-language-server on PATH (https://github.com/LuaLS/lua-language-server/releases)
 ```
@@ -146,8 +190,8 @@ claude plugin install lsp-kit@claude-lsp-kit
 ```
 
 Run `/reload-plugins` or restart Claude Code. Disable other LSP plugins for
-the same file types, such as `rust-analyzer-lsp` from the official
-marketplace.
+the same file types, such as `rust-analyzer-lsp` or `typescript-lsp` from
+the official marketplace.
 
 To update, after a release bumped the version in `plugin.json` and
 `.claude-plugin/marketplace.json`:
@@ -182,11 +226,12 @@ started with, and with it its manager.
 
   A running manager keeps the values it started with: end it (its pid is in
   the log) to apply new ones.
-- `node test/smoke.mjs <svelte|rust|lua> <root> <hover|references|documentSymbol|definition> <file:line:col>...`
+- `node test/smoke.mjs <svelte|typescript|rust|lua> <root> <hover|references|documentSymbol|definition> <file:line:col>...`
   drives the proxy like Claude Code does, on a private manager.
 - Each test below builds a throwaway project under `<scratchDir>`, runs its
   own private managers, and prints PASS/FAIL lines:
-- `node test/hooks.mjs <scratchDir>` checks what the hooks add.
+- `node test/hooks.mjs <scratchDir>` checks what the hooks add, with a
+  stub TypeScript 6 (not served) and then 7.
 - `node test/shared.mjs <scratchDir>` checks two sessions on one checkout
   share one server and each sees its own spelling of it. It checks documents
   stay open until the last session closes them or its proxy is killed, and
@@ -202,6 +247,13 @@ started with, and with it its manager.
   flight). The session's server stops when idle (one server per checkout
   however a request spells it), and a manager left alone exits. A server
   that can't start answers with the reason.
+- `node test/typescript.mjs <scratchDir>` installs TypeScript 7 into its
+  project (npm, so the first run needs the registry or npm's cache). It checks
+  definitions and references across two `.ts` files and an `.mjs` file
+  importing one, that two sessions share one server, and that the manager runs
+  the native binary itself. It also checks that pulled diagnostics reach the
+  session as pushes (after an open, and on refresh for other open files), and
+  that the TypeScript server counts toward the cap with a Lua server.
 - `node test/rust.mjs <scratchDir>` checks the manager holds rust-analyzer
   itself, a worktree pinned to another installed toolchain gets that
   toolchain's server, and every server exits with the manager.

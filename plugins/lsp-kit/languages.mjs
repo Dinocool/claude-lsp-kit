@@ -5,15 +5,25 @@ import { createRequire } from 'node:module';
 import { delimiter, dirname, join } from 'node:path';
 
 const SVELTE_CONFIGS = ['svelte.config.js', 'svelte.config.mjs', 'svelte.config.cjs', 'svelte.config.ts'];
+const TS_MARKERS = ['tsconfig.json', 'jsconfig.json', 'package.json'];
+const TS_LANGUAGES = {
+	'.ts': 'typescript',
+	'.mts': 'typescript',
+	'.cts': 'typescript',
+	'.tsx': 'typescriptreact',
+	'.js': 'javascript',
+	'.mjs': 'javascript',
+	'.cjs': 'javascript',
+	'.jsx': 'javascriptreact'
+};
 const SKIP_DIRS = new Set(['target', 'node_modules']);
 
 export const LANGUAGES = {
 	svelte: {
 		name: 'Svelte',
-		extensions: ['.svelte'],
-		languageId: 'svelte',
+		extensionToLanguage: { '.svelte': 'svelte' },
 		note: 'TypeScript-aware: definitions and references include the .ts/.js files a component imports',
-		watch: ['.ts', '.js', '.mts', '.mjs', '.cjs', '.cts', '.json', '.svelte'],
+		watch: [...Object.keys(TS_LANGUAGES), '.json', '.svelte'],
 		server: (root) => {
 			const path = svelteServer(root);
 			if (!path) throw new Error('svelte-language-server not found (npm install -g svelte-language-server)');
@@ -22,10 +32,25 @@ export const LANGUAGES = {
 		present: (root) => SVELTE_CONFIGS.some((f) => existsSync(join(root, f))),
 		available: (root) => !!svelteServer(root)
 	},
+	// TypeScript 7's own LSP server (`tsc --lsp`); TS 7 has no tsserver, and the
+	// wrappers around TS 6's tsserver can't serve a TS 7 project. It sees no
+	// .svelte file: Svelte support needs a tsserver plugin, which TS 7 lacks.
+	typescript: {
+		name: 'TypeScript and JavaScript',
+		extensionToLanguage: TS_LANGUAGES,
+		note: 'TypeScript 7; findReferences from a .ts/.js symbol misses its uses in .svelte files (ask from a .svelte use for those)',
+		watch: [...Object.keys(TS_LANGUAGES), '.json'],
+		server: (root) => {
+			const path = typescriptServer(root);
+			if (!path) throw new Error('TypeScript 7 not found (npm install -g typescript@7)');
+			return { command: path, args: ['--lsp', '--stdio'] };
+		},
+		present: (root) => TS_MARKERS.some((f) => existsSync(join(root, f))),
+		available: (root) => !!typescriptServer(root)
+	},
 	rust: {
 		name: 'Rust',
-		extensions: ['.rs'],
-		languageId: 'rust',
+		extensionToLanguage: { '.rs': 'rust' },
 		note: 'every crate in the repo, including nested ones; answers come back empty for ~15 s while it indexes, so retry an empty first result',
 		watch: ['.rs', '.toml'],
 		server: (root) => ({ command: rustAnalyzer(root), args: [] }),
@@ -36,8 +61,7 @@ export const LANGUAGES = {
 	},
 	lua: {
 		name: 'Lua',
-		extensions: ['.lua'],
-		languageId: 'lua',
+		extensionToLanguage: { '.lua': 'lua' },
 		note: 'scope and runtime from the project .luarc.json; documentSymbol outlines functions and file-level tables, not locals inside functions (workspaceSymbol finds those by name)',
 		watch: ['.lua'],
 		server: () => ({ command: 'lua-language-server', args: [] }),
@@ -87,17 +111,34 @@ export function luaOutline(symbols) {
 	return walk(symbols, false);
 }
 
-// The project's own svelte-language-server first, then the global install next to
-// this node binary (Windows: <prefix>/node_modules, unix: <prefix>/lib/node_modules).
-function svelteServer(root) {
-	const nodeDir = dirname(process.execPath);
+// Where a project's node tools come from: the project's own node_modules first,
+// then the global install next to this node binary (Windows:
+// <prefix>/node_modules, unix: <prefix>/lib/node_modules).
+const nodeDir = dirname(process.execPath);
+const toolDirs = (root) => [root, join(nodeDir, 'node_modules'), join(nodeDir, '..', 'lib', 'node_modules')];
+const resolveFrom = (dirs, request) => {
 	try {
-		return createRequire(import.meta.url).resolve('svelte-language-server/bin/server.js', {
-			paths: [root, join(nodeDir, 'node_modules'), join(nodeDir, '..', 'lib', 'node_modules')]
-		});
+		return createRequire(import.meta.url).resolve(request, { paths: dirs });
 	} catch {
 		return null;
 	}
+};
+
+const svelteServer = (root) => resolveFrom(toolDirs(root), 'svelte-language-server/bin/server.js');
+
+// The first TypeScript 7+ in toolDirs: a project still on TS 6 (Svelte's
+// tooling needs it) is served by the global TS 7. The `tsc` bin is a node
+// wrapper that runs the native compiler as its child, so stopping it could
+// orphan the server (as with rustup's proxy): the platform package's binary is
+// started directly, found as typescript/lib/getExePath.js finds it.
+function typescriptServer(root) {
+	for (const dir of toolDirs(root)) {
+		const pkg = resolveFrom([dir], 'typescript/package.json');
+		if (!pkg || Number(JSON.parse(readFileSync(pkg, 'utf8')).version.split('.')[0]) < 7) continue;
+		const native = resolveFrom([dirname(pkg)], `@typescript/typescript-${process.platform}-${process.arch}/package.json`);
+		return native && join(dirname(native), 'lib', process.platform === 'win32' ? 'tsc.exe' : 'tsc');
+	}
+	return null;
 }
 
 // The topmost Cargo.toml of every subtree (a workspace manifest covers its

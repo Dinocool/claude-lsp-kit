@@ -7,8 +7,9 @@
 // Files may sit in git worktrees under the root; each should start its own
 // server (watch the "server #n for <root>" lines), capped by the manager.
 import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { extname, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { LANGUAGES } from '../plugins/lsp-kit/languages.mjs';
 import { killManager, log, startProxy, wait } from './client.mjs';
 
 const [language, root, op, ...targets] = process.argv.slice(2);
@@ -26,7 +27,7 @@ for (const target of targets) {
 	const [file, line, col] = target.split(/:(?=\d)/);
 	const path = resolve(root, file);
 	const uri = pathToFileURL(path).href;
-	client.open(uri, language, readFileSync(path, 'utf8'));
+	client.open(uri, LANGUAGES[language].extensionToLanguage[extname(path)], readFileSync(path, 'utf8'));
 	const params = { textDocument: { uri }, position: { line: +line - 1, character: +col - 1 }, context: { includeDeclaration: false } };
 	// Servers answer empty while indexing; retry until a real answer or 90 s.
 	let r;
