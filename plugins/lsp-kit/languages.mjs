@@ -123,7 +123,10 @@ const resolveFrom = (dirs, request) => {
 // folder that doesn't exist. Instead npm runs a command in the environment it
 // gives package.json scripts (npm-exec docs, `--call`), where its config code
 // exports the global prefix as npm_config_global_prefix (@npmcli/config
-// lib/set-envs.js, npm 7 and later). The folder under the prefix is the npm
+// lib/set-envs.js). That variable is undocumented (npm's scripts docs list
+// only `npm_config_*` settings); it is set unconditionally since npm 7 and
+// still in npm 11.9. It is preferred over re-implementing npmrc resolution or
+// loading npm's bundled @npmcli/config. The folder under the prefix is the npm
 // folders docs' rule. A folder that doesn't exist is a failed lookup.
 // The manager asks once at its start (askNpm). Asking takes about a second, too
 // slow for every Grep hook, so the hooks reuse the manager's last good answer

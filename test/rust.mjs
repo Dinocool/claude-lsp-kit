@@ -78,17 +78,27 @@ await wait(8000);
 check(mainCodes().includes('E0505'), `it is still published after an edit and the pull it causes: ${JSON.stringify(mainCodes())}`);
 
 // other.rs keeps changing on disk; rust-analyzer asks for a refresh after each
-// change and the manager pulls main.rs again. That isn't use: the server still
-// stops when idle.
-const idleEnv = { LSP_KIT_PIPE: privatePipe(), LSP_KIT_IDLE_MS: '3000', CLAUDE_PLUGIN_DATA: join(process.argv[2], 'idle-data'), LSP_KIT_TRACE: '1' };
+// change and the manager pulls main.rs again. That isn't use. The session uses
+// the server (a request per write) until the pulls are flowing, which takes
+// rust-analyzer anywhere from a few seconds to over 15; then only the churn and
+// its pulls go on, and the server stops within the idle limit plus one check
+// (the manager checks every IDLE_MS).
+const IDLE_MS = 5000;
+const idleEnv = { LSP_KIT_PIPE: privatePipe(), LSP_KIT_IDLE_MS: String(IDLE_MS), CLAUDE_PLUGIN_DATA: join(process.argv[2], 'idle-data'), LSP_KIT_TRACE: '1' };
 const idle = startProxy('rust', real, { ...idleEnv, name: 'idle' });
 await idle.initialize(real);
-idle.open(pathToFileURL(join(real, 'src', 'main.rs')).href, 'rust', text);
+const idleUri = pathToFileURL(join(real, 'src', 'main.rs')).href;
+idle.open(idleUri, 'rust', text);
 let churn = 0;
 const stoppedIdle = () => idle.stderr.some((l) => / stopping Rust server #1 /.test(l));
-for (const end = Date.now() + 30000; !stoppedIdle() && Date.now() < end; await wait(300)) writeFileSync(join(repo, 'src', 'other.rs'), `pub fn other() -> u32 { ${++churn} }\n`);
-const idlePulls = readFileSync(join(idleEnv.CLAUDE_PLUGIN_DATA, `${idleEnv.LSP_KIT_PIPE}.log`), 'utf8').match(/ textDocument\/diagnostic /g)?.length ?? 0;
-check(stoppedIdle() && idlePulls > 3, `the server stops when idle while files keep changing (${churn} writes of other.rs, ${idlePulls} pulls of main.rs)`);
+const idlePulls = () => readFileSync(join(idleEnv.CLAUDE_PLUGIN_DATA, `${idleEnv.LSP_KIT_PIPE}.log`), 'utf8').match(/ textDocument\/diagnostic /g)?.length ?? 0;
+const touch = () => writeFileSync(join(repo, 'src', 'other.rs'), `pub fn other() -> u32 { ${++churn} }\n`);
+for (const end = Date.now() + 60000; idlePulls() < 4 && Date.now() < end; await wait(300)) touch(), await idle.req('textDocument/documentSymbol', { textDocument: { uri: idleUri } });
+const lastUse = Date.now();
+const pullsBefore = idlePulls();
+check(pullsBefore >= 4, `file churn makes the manager pull main.rs again (${pullsBefore} pulls after ${churn} writes of other.rs)`);
+for (; !stoppedIdle() && Date.now() - lastUse < 2 * IDLE_MS + 2000; await wait(300)) touch();
+check(stoppedIdle(), `the server still stops when idle, ${((Date.now() - lastUse) / 1000).toFixed(1)} s after its last use, while the pulls go on (${idlePulls() - pullsBefore} more)`);
 await idle.close();
 killManager(idle.manager);
 
