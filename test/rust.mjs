@@ -1,6 +1,6 @@
-// rust-analyzer runs as the proxy's own child, not behind rustup's proxy binary
-// (killing that one could orphan the real server), answers, and exits with the
-// proxy at the end of stdin. Under rustup, a worktree pinned to another
+// rust-analyzer runs as the manager's own child, not behind rustup's proxy
+// binary (killing that one could orphan the real server), answers, and exits
+// with the manager. Under rustup, a worktree pinned to another
 // installed toolchain by its rust-toolchain.toml gets that toolchain's server.
 // Builds a throwaway crate under <dir>.
 // Usage: node test/rust.mjs <scratchDir>   (needs rust-analyzer; skips without it)
@@ -9,7 +9,7 @@ import { mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'nod
 import { basename, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { LANGUAGES } from '../plugins/lsp-kit/languages.mjs';
-import { alive, check, finish, log, processPath, startProxy, wait } from './client.mjs';
+import { alive, check, finish, killManager, log, processPath, startProxy, wait } from './client.mjs';
 
 if (!LANGUAGES.rust.available()) {
 	log('SKIP rust-analyzer is not installed');
@@ -32,7 +32,7 @@ const client = startProxy('rust', root);
 await client.initialize(root);
 const [pid] = client.pids();
 const path = processPath(pid);
-check(/^rust-analyzer(\.exe)?$/i.test(basename(path)), `the proxy holds rust-analyzer itself (pid ${pid} is ${path})`);
+check(/^rust-analyzer(\.exe)?$/i.test(basename(path)), `the manager holds rust-analyzer itself (pid ${pid} is ${path})`);
 
 // Go to definition of `helper` from its call in main, retried while rust-analyzer indexes.
 const definitionIn = async (dir, c = client) => {
@@ -83,5 +83,7 @@ else {
 const pids = client.pids();
 client.proxy.stdin.end();
 await client.exited;
-check(pids.every((p) => !alive(p)), `end of stdin: every rust-analyzer (${pids.join(', ')}) exits with the proxy`);
+killManager(client.manager);
+for (let i = 0; i < 50 && pids.some(alive); i++) await wait(100);
+check(pids.every((p) => !alive(p)), `every rust-analyzer (${pids.join(', ')}) exits with the manager (pid ${client.manager})`);
 finish();

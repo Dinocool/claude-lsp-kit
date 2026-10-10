@@ -2,19 +2,22 @@
 
 A [Claude Code](https://claude.com/claude-code) plugin that gives the LSP tool
 **Svelte**, **Rust** and **Lua** language servers. It keeps them responsive in
-large repos and starts separate servers for the git worktrees agents work in.
+large repos, starts separate servers for the git worktrees agents work in, and
+shares each server among all sessions on the machine.
 
 ## What it fixes
 
-The language servers run behind one small stdio proxy
-(`plugins/lsp-kit/proxy.mjs`, no dependencies), which fixes four things.
+The language servers run in one manager process per machine
+(`plugins/lsp-kit/manager.mjs`), which every Claude Code session reaches
+through a small stdio proxy (`plugins/lsp-kit/proxy.mjs`); no dependencies. It
+fixes five things.
 
 **1. Whole-repo watcher fallbacks.** Claude Code's LSP client doesn't advertise
 `workspace.didChangeWatchedFiles`. Without it, `svelte-language-server` starts
 a chokidar watcher over the whole workspace, ignoring only `.git` and
 `node_modules`. That includes agent worktrees under `.claude/worktrees`, which
 are full copies of the repo. On Windows the crawl kept the server busy for
-minutes, so every request timed out. The proxy tells each server the client
+minutes, so every request timed out. lsp-kit tells each server the client
 reports file changes. It then watches each server's root itself with one
 native recursive `fs.watch`, skipping dot-directories, `node_modules` and
 `target`. Changes reach the server in batches.
@@ -32,36 +35,61 @@ session directory (`.claude/worktrees/<name>`) or beside it. A file in one goes
 to a server rooted at that worktree, so an agent's hover, definitions and
 references reflect its worktree's code, not main's.
 
-The same limits apply to every server, the session's own checkout included,
-so an idle session holds no index in memory:
+Git submodules belong to their superproject's server; a nested clone is its
+own checkout. Servers run in the home directory, so they never stop a
+worktree from being removed on Windows.
 
-- a server starts on the first request for its checkout;
-- at most 3 run at once per language and session, and the least recently
-  used one stops first;
-- a server stops after 10 minutes unused, or when its directory is deleted;
-- a server that stops, crashes or is killed starts again on the next request
-  for its checkout. The proxy keeps running; it exits only when Claude Code
-  shuts it down, and then stops every server it started.
+**4. One server per checkout for the whole machine.** Without it, every
+session ran its own copy of the same index (rust-analyzer ~3.5 GB, LuaLS
+~1.4 GB each), and eight sessions on one repo exhausted a 32 GB machine.
+Every session shares one server per language and checkout, however each
+session spells the checkout's path (drive-letter case, short names,
+junctions); each session only ever sees its own spelling.
 
-`workspaceSymbol` queries the session checkout's server (starting it if it
-stopped) and every other running server, and merges the results, so a symbol
-shows up once per running checkout. Each checkout has one server, however
-the client spells its path (drive-letter case, short names). Git submodules belong to their
-superproject's server; a nested clone is its own checkout. Servers run with the session
-root as their working directory, so they never stop a worktree from being
-removed on Windows.
+- A document stays open on a shared server until the last session that
+  opened it closes it or ends. When a second session opens or changes a
+  document, the server reloads it from disk.
+- Diagnostics go to every session with the document open.
+- `workspaceSymbol` asks the session checkout's server (starting it if it
+  stopped) and every other running server the session has used, and merges
+  the results.
+
+### Lifecycle
+
+- The first session to need a language server starts the manager, detached.
+  It listens on the named pipe `\\.\pipe\lsp-kit-<user>-p<version>` (a Unix
+  socket in the plugin data directory elsewhere). Only one process can own
+  it, so sessions starting together end up on one manager. `<version>` is a
+  digest of the manager's code: after an update that changes it, new sessions
+  start a new manager and the old one ends when its last session and server
+  are gone.
+- A server starts on the first request for its checkout, and stops after
+  10 minutes unused or when its directory is deleted.
+- At most 10 servers run machine-wide (`LSP_KIT_MAX_SERVERS`). Starting one
+  more stops the least recently used server without a request in flight. If
+  every server has one, the cap is exceeded and logged.
+- A server that stops, crashes or is killed starts again on the next request
+  for its checkout.
+- When a session ends, its documents are released; its servers stay for
+  the other sessions until they idle out. The manager exits once it has
+  neither sessions nor servers.
+- If the manager dies, its servers die with it, requests in flight fail with
+  that reason, and each session's next request starts a new manager. If the
+  manager can't be started or reached, every request fails with the reason.
+  There is no per-session fallback.
+- The manager runs with the environment of the session that started it.
 
 Recursive `fs.watch` is native and cheap on Windows and macOS. On Linux, Node
 20+ emulates it in JavaScript and watches every directory, which can hit
 inotify limits in very large trees.
 
-**4. Per-language setup.**
+**5. Per-language setup.**
 - **Rust:** rust-analyzer only looks for `Cargo.toml` at the root and one
-  level down. The proxy finds the top-level `Cargo.toml` in every subtree and
+  level down. lsp-kit finds the top-level `Cargo.toml` in every subtree and
   passes them all as `linkedProjects`, so crates like `tools/foo` or
   `app/src-tauri` get analysis. It also retries requests that get
   `ContentModified` while rust-analyzer reloads, because Claude Code doesn't.
-  Under rustup, the proxy starts the toolchain's rust-analyzer directly
+  Under rustup, lsp-kit starts the toolchain's rust-analyzer directly
   (`rustup which rust-analyzer`, run in the server's checkout so its
   `rust-toolchain.toml` applies): rustup's own `rust-analyzer` is a proxy
   that runs the real server as its child, which stopping it could orphan.
@@ -70,7 +98,7 @@ inotify limits in very large trees.
 - **Lua:** scope and runtime come from the project's `.luarc.json`. Without one
   bounding the workspace, LuaLS scans every file under the root. LuaLS's
   `documentSymbol` lists every local, parameter and `if` block of every
-  function (1,500 entries for a 1,900-line file); the proxy trims it to an
+  function (1,500 entries for a 1,900-line file); lsp-kit trims it to an
   outline: functions, methods, file-level variables and table fields, plus
   functions named inside function bodies, with their ranges.
   `workspaceSymbol` is not trimmed, so it still finds locals by name.
@@ -129,29 +157,46 @@ claude plugin update lsp-kit@claude-lsp-kit
 ```
 
 Then restart each Claude Code session: a running session keeps the proxy it
-started with.
+started with, and with it its manager.
 
 ## Debugging
 
-- `LSP_KIT_TRACE=1` in Claude Code's environment logs every proxied message to
-  the server's stderr.
+- The manager logs to `lsp-kit-<user>-p<version>.log` in the plugin data
+  directory (`~/.claude/plugins/data/<plugin id>/`), and each session's proxy
+  writes the same lines to its stderr (Claude Code's LSP log). The log of the
+  manager before it is kept as `.previous.log`, a crash's stack included.
 - Start and stop events are always logged, as `lsp-kit: <Lang> server #n for
-  <root> (<n> live, pid <pid>)`.
-- `LSP_KIT_IDLE_MS` overrides the 10-minute idle stop (the tests shorten it).
+  <root> (<n> live, pid <pid>)`, and each session's start as `session #n
+  (<Lang>, pid <proxy pid>) joined manager pid <pid>`.
+- These variables in Claude Code's environment (for example `env` in
+  `settings.json`) reach the manager when a session starts it:
+  - `LSP_KIT_TRACE=1` adds every message to the log.
+  - `LSP_KIT_MAX_SERVERS` sets the machine-wide cap (10).
+  - `LSP_KIT_IDLE_MS` sets the idle stop (10 minutes; the tests shorten it).
+  - `LSP_KIT_PIPE` names a private manager; the tests give each run its own.
+
+  A running manager keeps the values it started with: end it (its pid is in
+  the log) to apply new ones.
 - `node test/smoke.mjs <svelte|rust|lua> <root> <hover|references|documentSymbol|definition> <file:line:col>...`
-  drives the proxy like Claude Code does.
-- Each test below builds a throwaway project under `<scratchDir>` and prints
-  PASS/FAIL lines:
+  drives the proxy like Claude Code does, on a private manager.
+- Each test below builds a throwaway project under `<scratchDir>`, runs its
+  own private managers, and prints PASS/FAIL lines:
 - `node test/hooks.mjs <scratchDir>` checks what the hooks add.
+- `node test/shared.mjs <scratchDir>` checks two sessions on one checkout
+  share one server and each sees its own spelling of it. It checks documents
+  stay open until the last session closes them or its proxy is killed, and
+  diagnostics reach both sessions. A killed manager is replaced on the next
+  request, and proxies starting together end up on one manager.
 - `node test/lifecycle.mjs <scratchDir>` kills the session's and a
-  worktree's server, removes a worktree while its server runs, checks the
-  session's server counts toward the cap, lets it stop when idle (one server
-  per checkout however a request spells it), checks that a server that can't
-  start answers with the reason, and that exit and end of input stop every
-  server.
-- `node test/rust.mjs <scratchDir>` checks the proxy holds rust-analyzer
+  worktree's server, and removes a worktree while its server runs. It checks
+  killing the manager stops every server, and the machine-wide cap across
+  two sessions (least recently used first, never one with a request in
+  flight). The session's server stops when idle (one server per checkout
+  however a request spells it), and a manager left alone exits. A server
+  that can't start answers with the reason.
+- `node test/rust.mjs <scratchDir>` checks the manager holds rust-analyzer
   itself, a worktree pinned to another installed toolchain gets that
-  toolchain's server, and every server exits with the proxy.
+  toolchain's server, and every server exits with the manager.
 - `node test/roots.mjs <scratchDir>` checks a session started in a
   subdirectory roots Lua at the git toplevel (`.luarc.json` applies), a
   sibling worktree gets its own server, and the Lua outline.

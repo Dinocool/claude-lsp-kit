@@ -1,15 +1,15 @@
 // Drives the lsp-kit proxy like Claude Code's client and reports timing per
-// request plus the proxy's server start/stop log.
+// request plus the server start/stop log, on a private manager it stops at the end.
 //
 //   node test/smoke.mjs <language> <workspaceRoot> <op> <file:line:col> [<file:line:col> ...]
 //
 // op is an LSP method suffix: hover | references | documentSymbol | definition.
 // Files may sit in git worktrees under the root; each should start its own
-// server (watch the "server #n for <root>" lines), capped by the proxy.
+// server (watch the "server #n for <root>" lines), capped by the manager.
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { log, startProxy, wait } from './client.mjs';
+import { killManager, log, startProxy, wait } from './client.mjs';
 
 const [language, root, op, ...targets] = process.argv.slice(2);
 const client = startProxy(language, root);
@@ -39,3 +39,4 @@ for (const target of targets) {
 	log(`${op} ${file}:${line}:${col} -> ${describe(r)} (${((Date.now() - start) / 1000).toFixed(1)}s)`);
 }
 await client.close();
+killManager(client.manager);
