@@ -35,19 +35,29 @@ const path = processPath(pid);
 check(/^rust-analyzer(\.exe)?$/i.test(basename(path)), `the proxy holds rust-analyzer itself (pid ${pid} is ${path})`);
 
 // Go to definition of `helper` from its call in main, retried while rust-analyzer indexes.
-const definitionIn = async (dir) => {
+const definitionIn = async (dir, c = client) => {
 	const uri = pathToFileURL(join(dir, 'src', 'main.rs')).href;
-	client.open(uri, 'rust', text);
+	c.open(uri, 'rust', text);
 	let r;
-	for (let i = 0; i < 60; i++) {
-		r = await client.req('textDocument/definition', { textDocument: { uri }, position: { line: 1, character: 12 } });
+	for (let i = 0; i < 30; i++) {
+		r = await c.req('textDocument/definition', { textDocument: { uri }, position: { line: 1, character: 12 } });
 		if (r?.error || r?.length) break;
 		await wait(1000);
 	}
 	return r;
 };
-const definition = await definitionIn(root);
-check(definition?.some?.((d) => (d.range ?? d.targetRange)?.start.line === 0), `goToDefinition through ${root} finds helper: ${JSON.stringify(definition)?.slice(0, 120)}`);
+const findsHelper = async (session, dir, c) => {
+	const r = await definitionIn(dir, c);
+	check(r?.some?.((d) => (d.range ?? d.targetRange)?.start.line === 0), `session at ${session}, goToDefinition via ${dir} finds helper: ${JSON.stringify(r)?.slice(0, 100)}`);
+};
+const real = realpathSync.native(repo);
+await findsHelper(root, root);
+await findsHelper(root, real);
+const reverse = startProxy('rust', real);
+await reverse.initialize(real);
+await findsHelper(real, root, reverse);
+reverse.proxy.stdin.end();
+await reverse.exited;
 
 // A worktree pinned to another installed toolchain. Only installed ones: rustup
 // installs a pinned toolchain it doesn't have the moment anything asks.

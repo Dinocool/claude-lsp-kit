@@ -48,7 +48,7 @@
 // "<serverNo>:<id>" so the client's answers can be routed back.
 import { spawn } from 'node:child_process';
 import { existsSync, readFileSync, realpathSync, statSync, watch } from 'node:fs';
-import { dirname, extname, join, sep } from 'node:path';
+import { dirname, extname, join, relative, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { LANGUAGES, gitRoot } from './languages.mjs';
 
@@ -230,8 +230,10 @@ const rootFor = (uri) => (uri?.startsWith('file:') && gitRoot(dirname(fileURLToP
 // short names, subst drives, junctions, symlinks): realpathSync.native is the
 // true path (Node fs docs: realpath(3); libuv uv_fs_realpath:
 // GetFinalPathNameByHandleW on Windows). Only the key is canonical: a server is
-// rooted in the spelling that started it, the one its documents arrive in
-// (rust-analyzer answers nothing for a document outside its root's spelling).
+// rooted in a spelling the client uses (the session's own for the session
+// root, else the first request's), and documents reach it respelled under that
+// root, since rust-analyzer answers nothing for a document outside its root's
+// spelling.
 const keyOf = (root) => realpathSync.native(root);
 
 function serverFor(root) {
@@ -240,8 +242,14 @@ function serverFor(root) {
 	if (existing) return existing;
 	const live = [...servers.values()].sort((a, b) => a.lastUsed - b.lastUsed);
 	while (live.length >= MAX_SERVERS) stopServer(live.shift());
-	return startServer(root, key);
+	return startServer(key === keyOf(sessionRoot) ? sessionRoot : root, key);
 }
+
+// The document URI as the server spells it: its path under the server's root.
+const respell = (uri, root, server) =>
+	root === server.root ? uri : pathToFileURL(join(server.root, relative(root, fileURLToPath(uri)))).href;
+const withDocUri = (params, uri) =>
+	params.textDocument ? { ...params, textDocument: { ...params.textDocument, uri } } : { ...params, item: { ...params.item, uri } };
 
 setInterval(() => {
 	for (const s of servers.values()) if (Date.now() - s.lastUsed > IDLE_MS || !existsSync(s.root)) stopServer(s);
@@ -316,18 +324,19 @@ function fromClient(msg) {
 		else route(serverFor(sessionRoot), msg);
 		return;
 	}
-	if (msg.method === 'textDocument/didClose') {
-		// Closing never starts a server: a stopped one has nothing open.
-		const server = servers.get(keyOf(rootFor(uri)));
-		if (server?.openDocs.delete(uri)) route(server, msg);
-		return;
-	}
-	const server = serverFor(rootFor(uri));
-	if (msg.method === 'textDocument/didOpen') server.openDocs.add(uri);
-	else if (!server.openDocs.has(uri)) {
+	const root = rootFor(uri);
+	// Closing never starts a server: a stopped one has nothing open.
+	const server = msg.method === 'textDocument/didClose' ? servers.get(keyOf(root)) : serverFor(root);
+	if (!server) return;
+	const serverUri = respell(uri, root, server);
+	if (serverUri !== uri) msg = { ...msg, params: withDocUri(msg.params, serverUri) };
+	if (msg.method === 'textDocument/didOpen') server.openDocs.add(serverUri);
+	else if (msg.method === 'textDocument/didClose') {
+		if (!server.openDocs.delete(serverUri)) return;
+	} else if (!server.openDocs.has(serverUri)) {
 		// Opened on a server that has since stopped (or never had it): open from disk.
 		// Disk already holds an edit the client reports, so a didChange is replaced.
-		openFromDisk(server, uri, msg.params.textDocument?.version ?? 0);
+		openFromDisk(server, serverUri, msg.params.textDocument?.version ?? 0);
 		if (msg.method === 'textDocument/didChange') return;
 	}
 	route(server, msg);

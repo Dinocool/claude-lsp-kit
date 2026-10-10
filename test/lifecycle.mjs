@@ -105,6 +105,8 @@ await idleStop();
 // The client may spell the checkout differently (drive-letter case): still one server.
 const otherDrive = join(base, 'repo').replace(/^[a-z]/i, (c) => (c === c.toUpperCase() ? c.toLowerCase() : c.toUpperCase()));
 check((await refs(b, otherDrive)) === '3 refs', `a request spelled ${otherDrive} restarts it with the same answer`);
+const restart = b.stderr.filter((l) => / live, pid /.test(l)).at(-1);
+check(restart.includes(` for ${repo} (`), `it restarts in the session's own spelling: ${restart}`);
 check(await symbolHelper(), 'workspaceSymbol finds helper');
 const starts = b.stderr.filter((l) => / live, pid /.test(l)).length;
 check(starts === 3, `one server per checkout: ${starts} starts (the first and two restarts)`);
