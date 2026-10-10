@@ -47,7 +47,7 @@
 // proxy's own string ids "kit:<n>"); server->client requests are re-keyed
 // "<serverNo>:<id>" so the client's answers can be routed back.
 import { spawn } from 'node:child_process';
-import { existsSync, readFileSync, statSync, watch } from 'node:fs';
+import { existsSync, readFileSync, realpathSync, statSync, watch } from 'node:fs';
 import { dirname, extname, join, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { LANGUAGES, gitRoot } from './languages.mjs';
@@ -68,7 +68,7 @@ const RETRY_WINDOW_MS = 55 * 1000; // under Claude Code's 60 s request timeout
 const lang = LANGUAGES[process.argv[2]];
 if (!lang) throw new Error(`lsp-kit: unknown language "${process.argv[2]}"`);
 
-const servers = new Map(); // git root -> server
+const servers = new Map(); // keyOf(git root) -> server
 const running = new Set(); // every server whose process hasn't closed, stopping ones included
 const pendingClientRequests = new Map(); // client request id -> { server, msg, since }
 let clientInit = null;
@@ -119,9 +119,9 @@ function readFrames(input, onMessage) {
 
 // ---- servers ----------------------------------------------------------------
 
-function startServer(root) {
-	const server = { root, no: ++serverCount, openDocs: new Set(), lastUsed: Date.now(), waiting: new Map(), queue: [], ready: false };
-	servers.set(root, server);
+function startServer(root, key) {
+	const server = { root, key, no: ++serverCount, openDocs: new Set(), lastUsed: Date.now(), waiting: new Map(), queue: [], ready: false };
+	servers.set(key, server);
 	running.add(server);
 	try {
 		const { command, args } = lang.server(root);
@@ -164,7 +164,7 @@ function startServer(root) {
 function serverClosed(server, code) {
 	server.closed = true;
 	running.delete(server);
-	if (servers.get(server.root) === server) servers.delete(server.root);
+	if (servers.get(server.key) === server) servers.delete(server.key);
 	server.watcher?.close();
 	server.exitMessage = `lsp-kit: ${lang.name} server #${server.no} for ${server.root} ${server.startError ? `could not start: ${server.startError}` : `exited (code ${code})`}`;
 	for (const [id, pending] of pendingClientRequests) {
@@ -205,7 +205,7 @@ function request(server, method, params, now = false) {
 // server has answered (or closed); one still running after STOP_KILL_MS is killed.
 function stopServer(server) {
 	if (server.stopped) return server.stopped;
-	if (servers.get(server.root) === server) servers.delete(server.root);
+	if (servers.get(server.key) === server) servers.delete(server.key);
 	process.stderr.write(`lsp-kit: stopping ${lang.name} server #${server.no} for ${server.root}\n`);
 	server.watcher?.close();
 	setTimeout(() => server.child?.kill(), STOP_KILL_MS).unref();
@@ -223,15 +223,24 @@ function exitProxy() {
 	setTimeout(() => process.exit(exitCode()), STOP_KILL_MS + 1000);
 }
 
-// The git toplevel owning the file (canonical, so one key per checkout), else the session root.
+// The git toplevel owning the file, in the client's spelling, else the session root.
 const rootFor = (uri) => (uri?.startsWith('file:') && gitRoot(dirname(fileURLToPath(uri)))) || sessionRoot;
 
+// One key per checkout, however the client spells it (drive-letter case, 8.3
+// short names, subst drives, junctions, symlinks): realpathSync.native is the
+// true path (Node fs docs: realpath(3); libuv uv_fs_realpath:
+// GetFinalPathNameByHandleW on Windows). Only the key is canonical: a server is
+// rooted in the spelling that started it, the one its documents arrive in
+// (rust-analyzer answers nothing for a document outside its root's spelling).
+const keyOf = (root) => realpathSync.native(root);
+
 function serverFor(root) {
-	const existing = servers.get(root);
+	const key = keyOf(root);
+	const existing = servers.get(key);
 	if (existing) return existing;
 	const live = [...servers.values()].sort((a, b) => a.lastUsed - b.lastUsed);
 	while (live.length >= MAX_SERVERS) stopServer(live.shift());
-	return startServer(root);
+	return startServer(root, key);
 }
 
 setInterval(() => {
@@ -242,13 +251,24 @@ setInterval(() => {
 
 const docUri = (params) => params?.textDocument?.uri ?? params?.item?.uri;
 
+// A message the proxy can't route (its checkout vanished mid-way) is answered
+// with the reason; the proxy keeps serving.
 readFrames(process.stdin, (msg) => {
+	try {
+		fromClient(msg);
+	} catch (e) {
+		process.stderr.write(`lsp-kit: ${msg.method ?? 'response'} failed: ${e.message}\n`);
+		if (msg.method && msg.id != null) toClient({ jsonrpc: '2.0', id: msg.id, error: { code: -32603, message: `lsp-kit: ${e.message}` } });
+	}
+});
+
+function fromClient(msg) {
 	if (msg.method === 'initialize') {
 		clientInit = msg;
 		const folder = msg.params?.workspaceFolders?.[0]?.uri ?? msg.params?.rootUri;
 		const dir = folder ? fileURLToPath(folder) : process.cwd();
 		sessionRoot = gitRoot(dir) ?? dir;
-		const home = startServer(sessionRoot);
+		const home = serverFor(sessionRoot);
 		home.initialized.then((result) => answer(msg.id, home, result));
 		return;
 	}
@@ -298,7 +318,7 @@ readFrames(process.stdin, (msg) => {
 	}
 	if (msg.method === 'textDocument/didClose') {
 		// Closing never starts a server: a stopped one has nothing open.
-		const server = servers.get(rootFor(uri));
+		const server = servers.get(keyOf(rootFor(uri)));
 		if (server?.openDocs.delete(uri)) route(server, msg);
 		return;
 	}
@@ -311,7 +331,7 @@ readFrames(process.stdin, (msg) => {
 		if (msg.method === 'textDocument/didChange') return;
 	}
 	route(server, msg);
-});
+}
 
 function openFromDisk(server, uri, version) {
 	let text;
@@ -393,7 +413,7 @@ function watchRoot(server) {
 				const changes = [...pending].map(([p, type]) => ({ uri: pathToFileURL(p).href, type }));
 				pending = new Map();
 				timer = null;
-				if (servers.get(server.root) === server) write(server, { jsonrpc: '2.0', method: WATCHED_FILES, params: { changes } });
+				if (servers.get(server.key) === server) write(server, { jsonrpc: '2.0', method: WATCHED_FILES, params: { changes } });
 			}, 50);
 		});
 		server.watcher.on('error', (e) => process.stderr.write(`lsp-kit: watching ${server.root} failed: ${e.message}\n`));

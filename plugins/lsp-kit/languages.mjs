@@ -3,7 +3,7 @@
 // rewrites); the hooks read `name`, `extensions`, `note`, `present` and
 // `available`.
 import { execFileSync } from 'node:child_process';
-import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs';
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { delimiter, dirname, join } from 'node:path';
 
@@ -55,16 +55,13 @@ export const LANGUAGES = {
 // holding a `.git` directory (a main checkout) or a `.git` file pointing into a
 // repo's worktrees/ (a linked worktree). A submodule's `.git` file points into
 // modules/, so a submodule belongs to its superproject. null outside a repo.
-// The path comes back canonical, one spelling per checkout: the client's URIs
-// differ in drive-letter case and 8.3 short names (C:\Users\AESTHE~1), and
-// realpathSync.native returns the true spelling (Node fs docs: realpath(3);
-// libuv uv_fs_realpath: GetFinalPathNameByHandleW on Windows).
+// The path keeps the caller's spelling.
 export function gitRoot(dir) {
 	for (let d = dir; ; d = dirname(d)) {
 		const git = join(d, '.git');
 		try {
 			const st = statSync(git, { throwIfNoEntry: false });
-			if (st?.isDirectory() || (st?.isFile() && /^gitdir:.*[\\/]worktrees[\\/]/.test(readFileSync(git, 'utf8')))) return realpathSync.native(d);
+			if (st?.isDirectory() || (st?.isFile() && /^gitdir:.*[\\/]worktrees[\\/]/.test(readFileSync(git, 'utf8')))) return d;
 		} catch {} // unreadable: keep walking up
 		if (dirname(d) === d) return null;
 	}
