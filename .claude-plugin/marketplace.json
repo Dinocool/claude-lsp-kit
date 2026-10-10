@@ -1,0 +1,16 @@
+{
+	"name": "claude-svelte-lsp",
+	"owner": { "name": "Dinocool", "url": "https://github.com/Dinocool" },
+	"metadata": {
+		"description": "Svelte language server for Claude Code that stays responsive in large workspaces."
+	},
+	"plugins": [
+		{
+			"name": "svelte-lsp",
+			"source": "./plugins/svelte-lsp",
+			"description": "svelte-language-server with a native file watcher instead of its whole-workspace chokidar fallback, plus hooks that steer Claude to LSP navigation.",
+			"version": "1.1.0",
+			"category": "development"
+		}
+	]
+}
