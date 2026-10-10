@@ -1,10 +1,14 @@
-// Lifecycle test for the lsp-kit proxy (Lua): crash of a worktree server, then
-// removing a worktree while its server runs. Uses a throwaway repo under <dir>.
+// Lifecycle of the lsp-kit proxy's servers (Lua), in a throwaway repo under <dir>:
+// a crashed worktree server and a crashed session-root server both come back on
+// the next request in the same proxy; a worktree can be removed while its server
+// runs; the session root's server stops when idle and restarts on demand; the
+// client's exit and the end of stdin each stop every server the proxy started.
 // Usage: node test/lifecycle.mjs <scratchDir>   (needs lua-language-server and git)
-import { execSync, spawn } from 'node:child_process';
-import { mkdirSync, rmSync, writeFileSync, existsSync } from 'node:fs';
+import { execSync } from 'node:child_process';
+import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { pathToFileURL } from 'node:url';
+import { alive, check, finish, log, startProxy, wait } from './client.mjs';
 
 const base = process.argv[2];
 const repo = join(base, 'repo');
@@ -17,57 +21,72 @@ sh('git init -q && git add -A && git -c user.email=t@t -c user.name=t commit -qm
 sh('git worktree add -q .claude/worktrees/wt');
 const wt = join(repo, '.claude', 'worktrees', 'wt');
 
-const t0 = Date.now();
-const log = (m) => console.log(`+${((Date.now() - t0) / 1000).toFixed(1)}s ${m}`);
-const proxy = spawn(process.execPath, [fileURLToPath(new URL('../plugins/lsp-kit/proxy.mjs', import.meta.url)), 'lua'], { cwd: repo });
-proxy.stderr.on('data', (d) => d.toString().split('\n').filter((l) => l.startsWith('lsp-kit')).forEach((l) => log(l)));
-proxy.on('exit', (c) => log(`PROXY EXITED code ${c}`));
-let buf = Buffer.alloc(0), id = 0;
-const waits = new Map();
-const write = (m) => { const b = Buffer.from(JSON.stringify(m)); proxy.stdin.write(Buffer.concat([Buffer.from(`Content-Length: ${b.length}\r\n\r\n`), b])); };
-const req = (method, params) => new Promise((res) => (waits.set(++id, res), write({ jsonrpc: '2.0', id, method, params })));
-proxy.stdout.on('data', (d) => {
-	buf = Buffer.concat([buf, d]);
-	for (;;) {
-		const h = buf.indexOf('\r\n\r\n'); if (h < 0) return;
-		const n = +/Content-Length: (\d+)/.exec(buf.subarray(0, h))[1]; if (buf.length < h + 4 + n) return;
-		const m = JSON.parse(buf.subarray(h + 4, h + 4 + n)); buf = buf.subarray(h + 4 + n);
-		if (m.id != null && !m.method && waits.has(m.id)) waits.get(m.id)(m.error ? { error: m.error.message } : m.result);
-		else if (m.id != null && m.method) write({ jsonrpc: '2.0', id: m.id, result: null });
+// References to `helper` (declaration + 2 calls), retried while LuaLS loads the workspace.
+const refs = async (client, dir) => {
+	const params = { textDocument: { uri: pathToFileURL(join(dir, 'a.lua')).href }, position: { line: 0, character: 16 }, context: { includeDeclaration: true } };
+	let r;
+	for (let i = 0; i < 40; i++) {
+		r = await client.req('textDocument/references', params);
+		if (r?.error || r?.length === 3) break;
+		await wait(500);
 	}
-});
-const refs = async (file) => {
-	const uri = pathToFileURL(file).href;
-	const r = await req('textDocument/references', { textDocument: { uri }, position: { line: 0, character: 16 }, context: { includeDeclaration: true } });
 	return r?.error ? `ERROR ${r.error}` : `${r?.length ?? 0} refs`;
 };
-const wait = (ms) => new Promise((r) => setTimeout(r, ms));
-const lualsPids = () => sh('powershell -NoProfile -Command "(Get-Process lua-language-server -ErrorAction SilentlyContinue | Sort-Object StartTime | Select-Object -ExpandProperty Id) -join \',\'"', base).split(',').filter(Boolean);
+const until = async (cond, ms) => {
+	for (const end = Date.now() + ms; !cond() && Date.now() < end; ) await wait(100);
+	return cond();
+};
 
-const before = new Set(lualsPids());
-const rootUri = pathToFileURL(repo).href;
-await req('initialize', { processId: process.pid, rootUri, workspaceFolders: [{ uri: rootUri, name: 'repo' }], capabilities: {} });
-write({ jsonrpc: '2.0', method: 'initialized', params: {} });
-log('main: ' + (await refs(join(repo, 'a.lua'))));
-log('worktree: ' + (await refs(join(wt, 'a.lua'))));
+// ---- crashes, worktree removal, client exit -----------------------------------
+const a = startProxy('lua', repo);
+await a.initialize(repo);
+check((await refs(a, repo)) === '3 refs', 'main checkout answers');
+check((await refs(a, wt)) === '3 refs', 'worktree answers');
 
-// 1. Crash the worktree server (the newest LuaLS this proxy started).
-const mine = lualsPids().filter((p) => !before.has(p));
-log(`killing worktree LuaLS pid ${mine.at(-1)} (proxy owns ${mine.length})`);
-sh(`taskkill /F /PID ${mine.at(-1)}`, base);
+const wtPid = a.pidFor(wt);
+process.kill(wtPid);
 await wait(1500);
-log('worktree after crash: ' + (await refs(join(wt, 'a.lua'))));
-log('main after crash: ' + (await refs(join(repo, 'a.lua'))));
+check((await refs(a, wt)) === '3 refs' && a.pidFor(wt) !== wtPid, `worktree answers after its server (pid ${wtPid}) was killed`);
 
-// 2. Remove the worktree while its (restarted) server is alive.
+const mainPid = a.pidFor(repo);
+process.kill(mainPid);
+await wait(1500);
+check((await refs(a, repo)) === '3 refs' && a.pidFor(repo) !== mainPid, `main checkout answers after its server (pid ${mainPid}) was killed`);
+check(a.proxy.exitCode === null, `the proxy (pid ${a.proxy.pid}) is still running`);
+
 try {
 	sh('git worktree remove --force .claude/worktrees/wt');
-	log(`git worktree remove: ok (dir exists: ${existsSync(wt)})`);
+	check(!existsSync(wt), 'git worktree remove succeeds while its server runs');
 } catch (e) {
-	log(`git worktree remove FAILED: ${e.stderr?.toString().trim()}`);
+	check(false, `git worktree remove: ${e.stderr?.toString().trim()}`);
 }
-log('main after removal: ' + (await refs(join(repo, 'a.lua'))));
-await req('shutdown', null);
-write({ jsonrpc: '2.0', method: 'exit', params: null });
-await wait(2500);
-process.exit(0);
+check((await refs(a, repo)) === '3 refs', 'main checkout answers after the removal');
+
+const aPids = a.pids();
+const aCode = await a.close();
+check(aCode === 0, `shutdown + exit: the proxy exits with code 0 (got ${aCode})`);
+check(aPids.every((p) => !alive(p)), `shutdown + exit: every server it started has exited (${aPids.join(', ')})`);
+
+// ---- idle stop of the session root's server, end of stdin ----------------------
+const b = startProxy('lua', repo, { LSP_KIT_IDLE_MS: '3000' });
+await b.initialize(repo);
+check((await refs(b, repo)) === '3 refs', 'main checkout answers (3 s idle stop)');
+const idlePid = b.pidFor(repo);
+const stopped = await until(() => b.stderr.some((l) => l.includes(`stopping Lua server #1 for ${repo}`)) && !alive(idlePid), 15000);
+check(stopped, `the main checkout's server (pid ${idlePid}) stops when idle`);
+check((await refs(b, repo)) === '3 refs' && b.pidFor(repo) !== idlePid, 'the next request restarts it with the same answer');
+
+const bPids = b.pids();
+b.proxy.stdin.end();
+await b.exited;
+log('stdin ended: proxy exited');
+check(bPids.every((p) => !alive(p)), `end of stdin: every server the proxy started has exited (${bPids.join(', ')})`);
+
+// ---- a server that can't start ------------------------------------------------
+const c = startProxy('lua', repo, { PATH: '' });
+const init = await c.initialize(repo);
+check(/could not start: .*ENOENT/.test(init?.error), `initialize answers the start error (${init?.error})`);
+check(/could not start: .*ENOENT/.test(await refs(c, repo)), 'a request answers the next start error');
+check(c.proxy.exitCode === null, 'the proxy is still running');
+check((await c.close()) === 0, 'shutdown + exit');
+finish();

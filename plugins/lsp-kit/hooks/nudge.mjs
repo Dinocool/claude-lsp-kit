@@ -3,11 +3,12 @@
 // It never blocks; it only adds context:
 //   SessionStart, SubagentStart - which languages the LSP tool serves, what to use it for
 //   PreToolUse Grep             - the pattern is a bare identifier over a served language
+//                                 (a Grep of one file only when its language is served)
 //   PreToolUse Read             - a whole read of a large file in a served language
 // Tool hooks run on every Grep/Read, so they filter on the cheap input first and
 // probe only the languages that could match.
-import { existsSync, readFileSync } from 'node:fs';
-import { extname } from 'node:path';
+import { existsSync, readFileSync, statSync } from 'node:fs';
+import { extname, resolve } from 'node:path';
 import { LANGUAGES, gitRoot } from '../languages.mjs';
 
 const LARGE_FILE_LINES = 150;
@@ -18,6 +19,8 @@ const SCOPE = { svelte: /svelte|\b[cm]?[jt]sx?\b|\{[^}]*\b[jt]s\b/, rust: /\brs\
 
 let input, root;
 const served = (keys) => keys.map((k) => LANGUAGES[k]).filter((l) => l.present(root) && l.available(root));
+// The languages serving a file, by its extension (none for a file lsp-kit doesn't serve).
+const languagesOf = (file) => Object.keys(LANGUAGES).filter((k) => LANGUAGES[k].extensions.includes(extname(file)));
 
 // A hint is optional: any failure (odd input, unreadable file) means no hint, never an error.
 try {
@@ -34,6 +37,7 @@ function sessionNote() {
 	if (!langs.length) return null;
 	const list = langs.map((l) => `${l.name} (${l.extensions.join(', ')}; ${l.note})`).join('; ');
 	return (
+		'The LSP tool is deferred: load it once with ToolSearch query "select:LSP" before your first code lookup. ' +
 		`The LSP tool serves this project's ${list}. Use it for code navigation instead of Grep or whole-file Read: ` +
 		`documentSymbol = a file outline with line numbers (then Read only the ranges you need; ${LARGE_FILE_TIP}); ` +
 		'goToDefinition / findReferences / hover / incomingCalls / outgoingCalls at a symbol position; ' +
@@ -44,18 +48,18 @@ function sessionNote() {
 
 function toolHint(tool, args) {
 	if (tool === 'Grep' && IDENTIFIER.test(args.pattern ?? '')) {
+		const file = args.path && statSync(resolve(input.cwd ?? '', args.path), { throwIfNoEntry: false })?.isFile();
 		const scope = `${args.glob ?? ''} ${args.type ?? ''}`.trim();
-		const langs = served(Object.keys(SCOPE).filter((k) => !scope || SCOPE[k].test(scope)));
-		if (!langs.length) return null;
+		const keys = file ? languagesOf(args.path) : Object.keys(SCOPE).filter((k) => !scope || SCOPE[k].test(scope));
+		if (!served(keys).length) return null;
 		const name = args.pattern.replace(/\\b/g, '');
-		const exts = langs.flatMap((l) => l.extensions).join('/');
-		return `"${name}" is a symbol: the LSP tool is exact where Grep is textual. workspaceSymbol (query "${name}") finds its definition; findReferences / goToDefinition from a ${exts} file that uses it lists every usage.`;
+		return `"${name}" is a symbol. For the next lookup use LSP (ToolSearch "select:LSP" if not loaded): workspaceSymbol query "${name}" finds its definition; findReferences at that line lists every usage.`;
 	}
 	if (tool === 'Read' && args.offset == null && args.limit == null && existsSync(args.file_path ?? '')) {
-		const key = Object.keys(LANGUAGES).find((k) => LANGUAGES[k].extensions.includes(extname(args.file_path)));
-		if (!key) return null;
+		const keys = languagesOf(args.file_path);
+		if (!keys.length) return null;
 		const lines = readFileSync(args.file_path, 'utf8').split('\n').length;
-		if (lines > LARGE_FILE_LINES && served([key]).length)
+		if (lines > LARGE_FILE_LINES && served(keys).length)
 			return `${lines}-line file: LSP documentSymbol gives its outline with line numbers (${LARGE_FILE_TIP}); read only the ranges you need with offset/limit.`;
 	}
 	return null;

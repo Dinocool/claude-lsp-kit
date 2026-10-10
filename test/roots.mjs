@@ -4,10 +4,11 @@
 // rooted at that worktree, and documentSymbol comes back as the compact outline.
 // Builds a throwaway repo under <dir>.
 // Usage: node test/roots.mjs <scratchDir>   (needs lua-language-server and git)
-import { execSync, spawn } from 'node:child_process';
+import { execSync } from 'node:child_process';
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { pathToFileURL } from 'node:url';
+import { check, finish, log, startProxy, wait } from './client.mjs';
 
 const base = process.argv[2];
 const repo = join(base, 'repo');
@@ -41,35 +42,14 @@ writeFileSync(
 sh('git init -q && git add -A && git -c user.email=t@t -c user.name=t commit -qm init');
 sh(`git worktree add -q "${wt}"`);
 
-const t0 = Date.now();
-const log = (m) => console.log(`+${((Date.now() - t0) / 1000).toFixed(1)}s ${m}`);
-let failed = 0;
-const check = (ok, what) => (log(`${ok ? 'PASS' : 'FAIL'} ${what}`), ok || failed++);
-
-const stderr = [];
-const proxy = spawn(process.execPath, [fileURLToPath(new URL('../plugins/lsp-kit/proxy.mjs', import.meta.url)), 'lua'], { cwd: sub });
-proxy.stderr.on('data', (d) => d.toString().split('\n').filter((l) => l.startsWith('lsp-kit')).forEach((l) => (stderr.push(l), log(l))));
-let buf = Buffer.alloc(0), id = 0;
-const waits = new Map();
+const client = startProxy('lua', sub);
 const diagnostics = new Map(); // lower-cased decoded uri -> diagnostics
 const norm = (uri) => decodeURIComponent(uri).toLowerCase();
-const write = (m) => { const b = Buffer.from(JSON.stringify(m)); proxy.stdin.write(Buffer.concat([Buffer.from(`Content-Length: ${b.length}\r\n\r\n`), b])); };
-const req = (method, params) => new Promise((res) => (waits.set(++id, res), write({ jsonrpc: '2.0', id, method, params })));
-proxy.stdout.on('data', (d) => {
-	buf = Buffer.concat([buf, d]);
-	for (;;) {
-		const h = buf.indexOf('\r\n\r\n'); if (h < 0) return;
-		const n = +/Content-Length: (\d+)/.exec(buf.subarray(0, h))[1]; if (buf.length < h + 4 + n) return;
-		const m = JSON.parse(buf.subarray(h + 4, h + 4 + n)); buf = buf.subarray(h + 4 + n);
-		if (m.id != null && !m.method && waits.has(m.id)) waits.get(m.id)(m.error ? { error: m.error.message } : m.result);
-		else if (m.id != null && m.method) write({ jsonrpc: '2.0', id: m.id, result: null });
-		else if (m.method === 'textDocument/publishDiagnostics') diagnostics.set(norm(m.params.uri), m.params.diagnostics);
-	}
-});
-const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+client.onNotification = (m) => m.method === 'textDocument/publishDiagnostics' && diagnostics.set(norm(m.params.uri), m.params.diagnostics);
+const { req, stderr } = client;
 const open = (path) => {
 	const uri = pathToFileURL(path).href;
-	write({ jsonrpc: '2.0', method: 'textDocument/didOpen', params: { textDocument: { uri, languageId: 'lua', version: 1, text: readFileSync(path, 'utf8') } } });
+	client.open(uri, 'lua', readFileSync(path, 'utf8'));
 	return uri;
 };
 const diagnosticsFor = async (uri) => {
@@ -86,10 +66,8 @@ const outline = async (uri) => {
 };
 
 // The client roots the session at the subdirectory, as Claude Code does when its cwd is one.
-const subUri = pathToFileURL(sub).href;
-await req('initialize', { processId: process.pid, rootUri: subUri, workspaceFolders: [{ uri: subUri, name: 'addon' }], capabilities: {} });
-write({ jsonrpc: '2.0', method: 'initialized', params: {} });
-check(stderr.some((l) => l.endsWith(`server #1 for ${repo} (1 live)`)), `session server rooted at the git toplevel ${repo}, not ${sub}`);
+await client.initialize(sub);
+check(stderr.some((l) => l.includes(`server #1 for ${repo} (1 live`)), `session server rooted at the git toplevel ${repo}, not ${sub}`);
 
 const mainUri = open(join(sub, 'mod.lua'));
 const diags = (await diagnosticsFor(mainUri)) ?? [];
@@ -106,9 +84,6 @@ const wtUri = open(join(wt, 'addon', 'mod.lua'));
 check((await outline(wtUri)) === expected, 'the sibling worktree answers too');
 check(stderr.some((l) => l.includes(`server #2 for ${wt} `)), `the sibling worktree got its own server rooted at ${wt}`);
 
-await req('shutdown', null);
-write({ jsonrpc: '2.0', method: 'exit', params: null });
-await wait(1500);
+await client.close();
 sh(`git worktree remove --force "${wt}"`);
-log(failed ? `${failed} FAILED` : 'all passed');
-process.exit(failed ? 1 : 0);
+finish();

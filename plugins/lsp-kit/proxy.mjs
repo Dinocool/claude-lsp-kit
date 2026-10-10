@@ -21,20 +21,28 @@
 //
 // 3. Worktrees. Agents edit files in linked git worktrees (e.g.
 //    .claude/worktrees/<name>, or a sibling directory), so an agent's LSP calls
-//    see its worktree's code, not main's. Worktree servers start on first use.
-//    The session root's server answers `initialize` and lives as long as the
-//    proxy; at most MAX_WORKTREE_SERVERS others run at once (least recently
-//    used stops first), and each stops after IDLE_MS unused or once its
-//    directory is gone.
+//    see its worktree's code, not main's.
+//
+// Server lifecycle, one rule for every root (the session's own included): a
+// server starts on the first request for its root; at most MAX_SERVERS run at
+// once (least recently used stops first); each stops after IDLE_MS unused or
+// once its directory is gone. A server that exits, crashes or is stopped is
+// dropped, and the next request for its root starts a fresh one (LSP 3.17:
+// the client owns the server lifecycle, and `initialize` goes once per
+// process). The proxy itself exits only on the client's `exit` or the end of
+// its stdin, taking every server it started with it: Claude Code does not
+// restart a proxy that exits cleanly, so one dead server used to take the
+// language down for the rest of the session. Only the session root's first
+// `initialize` result answers the client's `initialize`.
 //
 // 4. Per-language setup from languages.mjs (server command, initialization
 //    options such as rust-analyzer's linkedProjects for nested crates, response
 //    rewrites such as the Lua documentSymbol outline).
 //
 // A document routed to a server that doesn't have it open (fresh or
-// restarted) is opened from disk first. workspace/symbol asks every live
-// server and merges the answers; other workspace-wide requests go to the
-// session root's server.
+// restarted) is opened from disk first. workspace/symbol asks the session
+// root's server and every other ready one and merges the answers; other
+// workspace-wide requests go to the session root's server.
 //
 // Ids: client requests keep their ids (servers only see client ids plus the
 // proxy's own string ids "kit:<n>"); server->client requests are re-keyed
@@ -45,8 +53,13 @@ import { dirname, extname, join, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { LANGUAGES, gitRoot } from './languages.mjs';
 
-const MAX_WORKTREE_SERVERS = 3;
-const IDLE_MS = 10 * 60 * 1000;
+// The session root's server counts: an index costs the same memory whichever
+// checkout it covers (rust-analyzer ~3.5 GB, LuaLS ~1.4 GB), and every session
+// runs its own proxy.
+const MAX_SERVERS = 3;
+// LSP_KIT_IDLE_MS: tests shorten the idle stop.
+const IDLE_MS = Number(process.env.LSP_KIT_IDLE_MS) || 10 * 60 * 1000;
+const STOP_KILL_MS = 5000; // a stopping server that hasn't exited by then is killed
 const WATCHED_FILES = 'workspace/didChangeWatchedFiles';
 const FILE_CHANGE = { Created: 1, Changed: 2, Deleted: 3 };
 const CONTENT_MODIFIED = -32801;
@@ -57,9 +70,13 @@ const lang = LANGUAGES[process.argv[2]];
 if (!lang) throw new Error(`lsp-kit: unknown language "${process.argv[2]}"`);
 
 const servers = new Map(); // git root -> server
+const running = new Set(); // every server whose process hasn't closed, stopping ones included
 const pendingClientRequests = new Map(); // client request id -> { server, msg, since }
 let clientInit = null;
+let clientConfig = null; // the last workspace/didChangeConfiguration, replayed to every new server
 let sessionRoot = null;
+let shutdownReceived = false;
+let exiting = false;
 let serverCount = 0;
 let proxyIds = 0;
 
@@ -107,7 +124,7 @@ function readFrames(input, onMessage) {
 function startServer(root) {
 	const server = { root, no: ++serverCount, openDocs: new Set(), lastUsed: Date.now(), waiting: new Map(), queue: [], ready: false };
 	servers.set(root, server);
-	process.stderr.write(`lsp-kit: ${lang.name} server #${server.no} for ${root} (${servers.size} live)\n`);
+	running.add(server);
 	try {
 		const { command, args } = lang.server(root);
 		// cwd stays the session root: on Windows a process's cwd can't be deleted, which
@@ -115,13 +132,13 @@ function startServer(root) {
 		server.child = spawn(command, args, { cwd: sessionRoot, stdio: ['pipe', 'pipe', 'inherit'] });
 		server.child.on('error', (e) => (server.startError = e.message));
 		server.child.stdin.on('error', () => {}); // a write racing the child's exit; 'close' cleans up
-		server.child.on('close', () => serverClosed(server));
+		server.child.on('close', (code) => serverClosed(server, code));
 		readFrames(server.child.stdout, (msg) => fromServer(server, msg));
 	} catch (e) {
 		server.startError = e.message;
 		setImmediate(() => serverClosed(server));
-		return server;
 	}
+	process.stderr.write(`lsp-kit: ${lang.name} server #${server.no} for ${root} (${servers.size} live, pid ${server.child?.pid})\n`);
 
 	const uri = pathToFileURL(root).href;
 	const params = structuredClone(clientInit.params ?? {});
@@ -134,8 +151,9 @@ function startServer(root) {
 	params.capabilities.workspace.didChangeWatchedFiles = { dynamicRegistration: true };
 	params.initializationOptions = { ...lang.initializationOptions?.(root), ...params.initializationOptions };
 	server.initialized = request(server, 'initialize', params, true).then((result) => {
-		if (server.closed) return result;
+		if (server.closed) return;
 		write(server, { jsonrpc: '2.0', method: 'initialized', params: {} });
+		if (clientConfig) write(server, clientConfig);
 		server.ready = true;
 		for (const msg of server.queue.splice(0)) write(server, msg);
 		watchRoot(server);
@@ -144,22 +162,27 @@ function startServer(root) {
 	return server;
 }
 
-function serverClosed(server) {
+// The process is gone: its client requests fail with the reason, and the next
+// request for its root starts a new server.
+function serverClosed(server, code) {
 	server.closed = true;
+	running.delete(server);
 	if (servers.get(server.root) === server) servers.delete(server.root);
 	server.watcher?.close();
-	const message = `lsp-kit: ${lang.name} server for ${server.root} ${server.startError ? `could not start: ${server.startError}` : 'exited'}`;
+	server.exitMessage = `lsp-kit: ${lang.name} server #${server.no} for ${server.root} ${server.startError ? `could not start: ${server.startError}` : `exited (code ${code})`}`;
 	for (const [id, pending] of pendingClientRequests) {
 		if (pending.server !== server) continue;
 		pendingClientRequests.delete(id);
-		toClient({ jsonrpc: '2.0', id, error: { code: -32603, message } });
+		answer(id, server);
 	}
 	for (const resolve of server.waiting.values()) resolve(null);
-	process.stderr.write(message + '\n');
-	if (server.root !== sessionRoot) return;
-	if (!server.ready) toClient({ jsonrpc: '2.0', id: clientInit.id, error: { code: -32603, message } });
-	process.exit(server.startError ? 1 : 0);
+	process.stderr.write(server.exitMessage + '\n');
+	if (exiting && !running.size) process.exit(exitCode());
 }
+
+// A client request's answer, or the server's exit message once it has closed.
+const answer = (id, server, result) =>
+	toClient(server.closed ? { jsonrpc: '2.0', id, error: { code: -32603, message: server.exitMessage } } : { jsonrpc: '2.0', id, result });
 
 function write(server, msg) {
 	trace('->', server.no, msg);
@@ -181,12 +204,26 @@ function request(server, method, params, now = false) {
 	return new Promise((resolve) => server.waiting.set(id, resolve));
 }
 
+// LSP 3.17: `shutdown`, then `exit` once it is answered. Resolves when the
+// server has answered (or closed); one still running after STOP_KILL_MS is killed.
 function stopServer(server) {
-	servers.delete(server.root);
+	if (server.stopped) return server.stopped;
+	if (servers.get(server.root) === server) servers.delete(server.root);
 	process.stderr.write(`lsp-kit: stopping ${lang.name} server #${server.no} for ${server.root}\n`);
 	server.watcher?.close();
-	request(server, 'shutdown', null).then(() => write(server, { jsonrpc: '2.0', method: 'exit', params: null }));
-	setTimeout(() => server.child?.kill(), 5000).unref();
+	setTimeout(() => server.child?.kill(), STOP_KILL_MS).unref();
+	return (server.stopped = request(server, 'shutdown', null).then(() => write(server, { jsonrpc: '2.0', method: 'exit', params: null })));
+}
+
+// The client's `exit` or the end of stdin: every server this proxy started is
+// stopped, and the proxy exits once all have closed. The ref'd timer bounds the
+// wait should a killed server's pipes stay open.
+const exitCode = () => (shutdownReceived ? 0 : 1); // LSP 3.17: 0 only after `shutdown`
+function exitProxy() {
+	exiting = true;
+	for (const s of running) stopServer(s);
+	if (!running.size) process.exit(exitCode());
+	setTimeout(() => process.exit(exitCode()), STOP_KILL_MS + 1000);
 }
 
 // The git toplevel owning the file, else the session root. Matched to a live
@@ -201,16 +238,14 @@ function rootFor(uri) {
 function serverFor(root) {
 	const existing = servers.get(root);
 	if (existing) return existing;
-	const worktrees = [...servers.values()].filter((s) => s.root !== sessionRoot).sort((a, b) => a.lastUsed - b.lastUsed);
-	while (worktrees.length >= MAX_WORKTREE_SERVERS) stopServer(worktrees.shift());
+	const live = [...servers.values()].sort((a, b) => a.lastUsed - b.lastUsed);
+	while (live.length >= MAX_SERVERS) stopServer(live.shift());
 	return startServer(root);
 }
 
 setInterval(() => {
-	for (const s of servers.values()) {
-		if (s.root !== sessionRoot && (Date.now() - s.lastUsed > IDLE_MS || !existsSync(s.root))) stopServer(s);
-	}
-}, 60 * 1000).unref();
+	for (const s of servers.values()) if (Date.now() - s.lastUsed > IDLE_MS || !existsSync(s.root)) stopServer(s);
+}, Math.min(IDLE_MS, 60 * 1000)).unref();
 
 // ---- client -> servers ------------------------------------------------------
 
@@ -222,19 +257,18 @@ readFrames(process.stdin, (msg) => {
 		const folder = msg.params?.workspaceFolders?.[0]?.uri ?? msg.params?.rootUri;
 		const dir = folder ? fileURLToPath(folder) : process.cwd();
 		sessionRoot = gitRoot(dir) ?? dir;
-		startServer(sessionRoot).initialized?.then((result) => toClient({ jsonrpc: '2.0', id: msg.id, result }));
+		const home = startServer(sessionRoot);
+		home.initialized.then((result) => answer(msg.id, home, result));
 		return;
 	}
 	if (msg.method === 'initialized') return; // each server gets its own from the proxy
 	if (msg.method === 'shutdown') {
-		const home = servers.get(sessionRoot);
-		for (const s of servers.values()) if (s !== home) stopServer(s);
-		request(home, 'shutdown', null).then(() => toClient({ jsonrpc: '2.0', id: msg.id, result: null }));
+		shutdownReceived = true;
+		Promise.all([...running].map(stopServer)).then(() => toClient({ jsonrpc: '2.0', id: msg.id, result: null }));
 		return;
 	}
 	if (msg.method === 'exit') {
-		for (const s of servers.values()) write(s, msg);
-		setTimeout(() => process.exit(0), 2000).unref();
+		exitProxy();
 		return;
 	}
 	if (msg.method === '$/cancelRequest') {
@@ -261,19 +295,27 @@ readFrames(process.stdin, (msg) => {
 	const uri = docUri(msg.params);
 	if (!uri) {
 		if (msg.method === 'workspace/symbol') {
-			const live = [...servers.values()].filter((s) => s.ready);
-			Promise.all(live.map((s) => request(s, msg.method, msg.params))).then((answers) =>
-				toClient({ jsonrpc: '2.0', id: msg.id, result: answers.flatMap((a) => a ?? []) })
+			// The session root's server (started if stopped) plus every other ready one.
+			const home = serverFor(sessionRoot);
+			const asked = new Set([home, ...[...servers.values()].filter((s) => s.ready)]);
+			Promise.all([...asked].map((s) => request(s, msg.method, msg.params))).then((answers) =>
+				answer(msg.id, home, answers.flatMap((a) => a ?? []))
 			);
-		} else if (msg.method === 'workspace/didChangeConfiguration') for (const s of servers.values()) send(s, msg);
-		else route(servers.get(sessionRoot), msg);
+		} else if (msg.method === 'workspace/didChangeConfiguration') {
+			clientConfig = msg; // a server still starting gets it once initialized
+			for (const s of servers.values()) if (s.ready) write(s, msg);
+		} else route(serverFor(sessionRoot), msg);
+		return;
+	}
+	if (msg.method === 'textDocument/didClose') {
+		// Closing never starts a server: a stopped one has nothing open.
+		const server = servers.get(rootFor(uri));
+		if (server?.openDocs.delete(uri)) route(server, msg);
 		return;
 	}
 	const server = serverFor(rootFor(uri));
 	if (msg.method === 'textDocument/didOpen') server.openDocs.add(uri);
-	else if (msg.method === 'textDocument/didClose') {
-		if (!server.openDocs.delete(uri)) return;
-	} else if (!server.openDocs.has(uri)) {
+	else if (!server.openDocs.has(uri)) {
 		// Opened on a server that has since stopped (or never had it): open from disk.
 		// Disk already holds an edit the client reports, so a didChange is replaced.
 		openFromDisk(server, uri, msg.params.textDocument?.version ?? 0);
@@ -371,7 +413,4 @@ function watchRoot(server) {
 	}
 }
 
-process.stdin.on('end', () => {
-	for (const s of servers.values()) s.child?.kill();
-	process.exit(0);
-});
+process.stdin.on('end', exitProxy);
