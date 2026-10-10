@@ -4,13 +4,13 @@
 // changes follow.
 // Usage: node test/svelte.mjs <scratchDir>   (needs svelte-language-server and git)
 import { execSync } from 'node:child_process';
-import { mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { LANGUAGES } from '../plugins/lsp-kit/languages.mjs';
-import { check, finish, log, privatePipe, startProxy, wait } from './client.mjs';
+import { check, finish, log, privatePipe, scratch, startProxy, wait } from './client.mjs';
 
-rmSync(process.argv[2], { recursive: true, force: true });
+scratch(process.argv[2]);
 mkdirSync(join(process.argv[2], 'app'), { recursive: true });
 const app = join(realpathSync.native(process.argv[2]), 'app');
 if (!LANGUAGES.svelte.available(app)) {

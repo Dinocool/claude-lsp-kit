@@ -5,12 +5,12 @@
 // Builds a throwaway repo under <dir>.
 // Usage: node test/roots.mjs <scratchDir>   (needs lua-language-server and git)
 import { execSync } from 'node:child_process';
-import { mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { check, finish, log, startProxy, wait } from './client.mjs';
+import { check, finish, log, scratch, startProxy, wait } from './client.mjs';
 
-rmSync(process.argv[2], { recursive: true, force: true });
+scratch(process.argv[2]);
 mkdirSync(join(process.argv[2], 'repo', 'addon'), { recursive: true });
 const base = realpathSync.native(process.argv[2]); // the spelling the proxy logs
 const repo = join(base, 'repo');

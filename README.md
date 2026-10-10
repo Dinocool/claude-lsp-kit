@@ -123,11 +123,23 @@ junctions); each session only ever sees its own spelling.
   `rust-toolchain.toml` applies): rustup's own `rust-analyzer` is a proxy
   that runs the real server as its child, which stopping it could orphan.
 - **Svelte:** the server comes from the project's `node_modules` if it's
-  there, otherwise from npm's global folder. lsp-kit asks npm where that is
-  ([`npm root -g`](https://docs.npmjs.com/cli/commands/npm-root)), which covers
-  the Windows installer's `%AppData%\npm`, a custom prefix and version
-  managers. It keeps the answer in `lsp-kit-npm-root.json` in the plugin data
-  directory, keyed by the node binary, the prefix setting and `~/.npmrc`.
+  there, otherwise from npm's global folder. That covers the Windows
+  installer's `%AppData%\npm`, a custom prefix and version managers.
+  - lsp-kit asks npm for the folder by running
+    `npm exec --call "node -p process.env.npm_config_global_prefix"`
+    ([npm exec](https://docs.npmjs.com/cli/commands/npm-exec) runs it in the
+    environment npm gives package.json scripts). The folder under that
+    prefix follows npm's
+    [folders](https://docs.npmjs.com/cli/configuring-npm/folders) rule.
+  - It doesn't use `npm root -g`: npm prints every UUID-like path segment as
+    `***` (`@npmcli/redact`), so a prefix under Claude's temp folder would come
+    back as a folder that doesn't exist.
+  - An answer whose folder doesn't exist is a failed lookup, and a server
+    that needed the folder names npm's answer in its start error.
+  - The manager asks once at its start and logs the answer. The hooks reuse
+    its last good answer from `lsp-kit-npm-root.json` in the plugin data
+    directory. That file keeps one key: the node binary, the prefix setting
+    and `~/.npmrc`.
 - **TypeScript and JavaScript:** one TypeScript 7 server per checkout serves
   every `.ts`/`.js` flavour. TypeScript 7 (July 2026) is the native port and
   ships its own LSP server; Microsoft's
@@ -154,7 +166,10 @@ junctions); each session only ever sees its own spelling.
     `findReferences` from a `.ts` symbol misses its uses in `.svelte` files,
     and `goToDefinition` on a component import in a `.ts` file lands on the
     ambient `*.svelte` module. Ask the Svelte server, from a `.svelte` file,
-    for those.
+    for those. For the same reason the TypeScript server reports false errors
+    about `*.svelte` modules in `.ts` files (TS2614 for a component's named
+    export, say). lsp-kit passes them on unfiltered: they are its blind spot,
+    and `svelte-check` is the authority.
   - **Files outside every tsconfig** (a `scripts/` folder the tsconfig doesn't
     include, say) each get an inferred project. References from a project
     file reach them only once they are open.
@@ -279,7 +294,11 @@ started with, and with it its manager.
   TypeScript 7, the log names both versions, and its removed `baseUrl`
   reaches the session as a tsconfig diagnostic. A TypeScript 7 without its
   platform package fails with that package's name. npm's global folder is
-  an empty one of its own.
+  an empty one of its own. A global TypeScript 7 under a UUID-named folder
+  serves a project without one, and a global folder that doesn't exist is
+  named in the start error.
+- Every test keeps its plugin data (manager logs, the npm lookup cache) in
+  its scratch folder.
 - `node test/rust.mjs <scratchDir>` checks the manager holds rust-analyzer
   itself, a worktree pinned to another installed toolchain gets that
   toolchain's server, and every server exits with the manager. A borrow

@@ -9,17 +9,17 @@
 // Builds a throwaway crate under <dir>.
 // Usage: node test/rust.mjs <scratchDir>   (needs rust-analyzer; skips without it)
 import { execFileSync, execSync } from 'node:child_process';
-import { mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { LANGUAGES } from '../plugins/lsp-kit/languages.mjs';
-import { alive, check, finish, killManager, log, privatePipe, processPath, startProxy, wait } from './client.mjs';
+import { alive, check, finish, killManager, log, privatePipe, processPath, scratch, startProxy, wait } from './client.mjs';
 
 if (!LANGUAGES.rust.available()) {
 	log('SKIP rust-analyzer is not installed');
 	process.exit(0);
 }
-rmSync(process.argv[2], { recursive: true, force: true });
+scratch(process.argv[2]);
 const repo = join(process.argv[2], 'crate');
 mkdirSync(join(repo, 'src'), { recursive: true });
 const sh = (c, cwd = repo) => execSync(c, { cwd, stdio: 'pipe' }).toString().trim();

@@ -7,13 +7,13 @@
 // manager left with no session and no server exits.
 // Usage: node test/lifecycle.mjs <scratchDir>   (needs lua-language-server and git)
 import { execSync } from 'node:child_process';
-import { existsSync, mkdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, realpathSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { alive, check, consoleWindow, finish, killManager, log, privatePipe, startProxy, wait } from './client.mjs';
+import { alive, check, consoleWindow, finish, killManager, log, privatePipe, scratch, startProxy, wait } from './client.mjs';
 
 const base = process.argv[2];
-rmSync(base, { recursive: true, force: true });
+scratch(base);
 mkdirSync(join(base, 'repo'), { recursive: true });
 const repo = realpathSync.native(join(base, 'repo')); // the spelling the manager logs
 const sh = (c, cwd = repo) => execSync(c, { cwd, stdio: 'pipe' }).toString().trim();

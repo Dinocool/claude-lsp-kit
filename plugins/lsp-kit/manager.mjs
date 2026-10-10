@@ -60,7 +60,7 @@ import { connect, createServer } from 'node:net';
 import { createInterface } from 'node:readline';
 import { dirname, extname, isAbsolute, join, relative, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { LANGUAGES, gitRoot } from './languages.mjs';
+import { LANGUAGES, askNpm, gitRoot } from './languages.mjs';
 import { endpoint, frame, readFrames } from './rpc.mjs';
 
 // Machine-wide, across sessions and languages. The cap stops a server only when
@@ -131,6 +131,8 @@ listener.listen(PIPE, () => {
 		renameSync(LOG, LOG.replace(/\.log$/, '.previous.log'));
 	} catch {} // no earlier log
 	log(`manager pid ${process.pid} on ${PIPE} (cap ${MAX_SERVERS} servers, idle stop ${IDLE_MS / 1000} s)`);
+	const npm = askNpm();
+	log(npm.dir ? `npm's global folder: ${npm.dir}` : npm.error);
 });
 
 // ---- servers ------------------------------------------------------------------

@@ -4,18 +4,18 @@
 // only): first 6.x, which has no LSP server, then 7.x.
 // Usage: node test/hooks.mjs <scratchDir>   (needs lua-language-server)
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { check, finish } from './client.mjs';
+import { check, finish, scratch } from './client.mjs';
 
 const root = join(process.argv[2], 'project');
-rmSync(process.argv[2], { recursive: true, force: true });
+scratch(process.argv[2]);
 mkdirSync(root, { recursive: true });
 // An empty npm global folder (npm's prefix setting), so a global TypeScript 7 on
 // this machine doesn't count.
 const env = { ...process.env, npm_config_prefix: join(process.argv[2], 'empty-prefix') };
-mkdirSync(env.npm_config_prefix);
+mkdirSync(join(env.npm_config_prefix, process.platform === 'win32' ? '' : 'lib', 'node_modules'), { recursive: true });
 writeFileSync(join(root, '.luarc.json'), '{}');
 writeFileSync(join(root, 'big.lua'), 'local x = 1\n'.repeat(200));
 writeFileSync(join(root, 'x.mjs'), 'export const helper = 1;\n');

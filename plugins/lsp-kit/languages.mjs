@@ -35,7 +35,7 @@ export const LANGUAGES = {
 	typescript: {
 		name: 'TypeScript and JavaScript',
 		extensionToLanguage: extensionsOf('typescript'),
-		note: 'TypeScript 7, also for a TypeScript 6 project (TypeScript 7 semantics: a tsconfig option it removed, such as baseUrl, breaks resolution and empties answers); findReferences from a .ts/.js symbol misses its uses in .svelte files (ask from a .svelte use for those)',
+		note: 'TypeScript 7, also for a TypeScript 6 project (TypeScript 7 semantics: a tsconfig option it removed, such as baseUrl, breaks resolution and empties answers); findReferences from a .ts/.js symbol misses its uses in .svelte files (ask from a .svelte use for those), and its errors about *.svelte modules (TS2614 for the named export of a component, say) are its blind spot: svelte-check is the authority',
 		watch: [...TS_EXTENSIONS, '.json'],
 		server: typescriptServer,
 		present: (root) => TS_MARKERS.some((f) => existsSync(join(root, f))),
@@ -114,37 +114,55 @@ const resolveFrom = (dirs, request) => {
 	}
 };
 
-// npm's global install folder as npm reports it (`npm root -g`; npm docs,
-// "npm-root" and "folders"), which covers the Windows installer's
-// %AppData%\npm, a custom prefix and version managers' prefixes. Asking npm
-// takes about half a second, too slow for every Grep hook, so the answer is
-// kept in a file, keyed by what npm derives it from: the node binary, the
-// prefix setting and the user's .npmrc. A failed ask isn't kept.
-let npmRoot;
-export function globalModules() {
-	if (npmRoot !== undefined) return npmRoot;
+// npm's global install folder, as npm's own config resolves it: this covers the
+// Windows installer's %AppData%\npm, a custom prefix and version managers.
+// `npm root -g` can't be read: all of npm 11's output goes through
+// @npmcli/redact's redactLog, which prints every UUID-like path segment as
+// `***` (its lib/index.js; the logging docs list only passwords and tokens, and
+// there is no opt-out), so a prefix under Claude's temp folder comes back as a
+// folder that doesn't exist. Instead npm runs a command in the environment it
+// gives package.json scripts (npm-exec docs, `--call`), where its config code
+// exports the global prefix as npm_config_global_prefix (@npmcli/config
+// lib/set-envs.js, npm 7 and later). The folder under the prefix is the npm
+// folders docs' rule. A folder that doesn't exist is a failed lookup.
+// The manager asks once at its start (askNpm). Asking takes about a second, too
+// slow for every Grep hook, so the hooks reuse the manager's last good answer
+// from a file, kept for one key: what npm derives it from (the node binary, the
+// prefix setting and the user's .npmrc).
+let npmGlobal; // { dir } or { error }
+const npmKey = () => {
 	const userConfig = process.env.npm_config_userconfig || join(homedir(), '.npmrc');
-	const key = [process.execPath, process.env.npm_config_prefix ?? '', statSync(userConfig, { throwIfNoEntry: false })?.mtimeMs ?? 0].join('|');
-	const file = join(dataDir(), 'lsp-kit-npm-root.json');
-	let cache = {};
-	try {
-		cache = JSON.parse(readFileSync(file, 'utf8'));
-	} catch {} // none yet
-	if (Object.hasOwn(cache, key)) return (npmRoot = cache[key]);
+	return [process.execPath, process.env.npm_config_prefix ?? '', statSync(userConfig, { throwIfNoEntry: false })?.mtimeMs ?? 0].join('|');
+};
+const npmCache = () => join(dataDir(), 'lsp-kit-npm-root.json');
+
+export function askNpm() {
+	let prefix = '';
 	try {
 		// windowsHide: run from the console-less manager, it would flash a console window.
-		npmRoot = execSync('npm root -g', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true }).trim();
-	} catch {
-		return (npmRoot = null);
-	}
+		prefix = execSync('npm exec --call "node -p process.env.npm_config_global_prefix"', { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true }).trim();
+	} catch {} // no npm: the answer is empty
+	const dir = prefix && join(prefix, process.platform === 'win32' ? '' : 'lib', 'node_modules');
+	if (!dir || !existsSync(dir)) return (npmGlobal = { error: `npm's global folder ${dir ? `${dir} doesn't exist` : 'is unknown (npm gave no answer)'}` });
 	try {
-		mkdirSync(dirname(file), { recursive: true });
-		writeFileSync(file, JSON.stringify({ ...cache, [key]: npmRoot }));
-	} catch {} // unwritable: ask again next time
-	return npmRoot;
+		mkdirSync(dataDir(), { recursive: true });
+		writeFileSync(npmCache(), JSON.stringify({ key: npmKey(), dir }));
+	} catch {} // unwritable: the hooks ask npm themselves
+	return (npmGlobal = { dir });
 }
 
-const svelteServer = (root) => resolveFrom([root, globalModules()], 'svelte-language-server/bin/server.js');
+function globalModules() {
+	if (!npmGlobal) {
+		let cached;
+		try {
+			cached = JSON.parse(readFileSync(npmCache(), 'utf8'));
+		} catch {} // none yet
+		npmGlobal = cached?.key === npmKey() && existsSync(cached.dir) ? { dir: cached.dir } : askNpm();
+	}
+	return npmGlobal;
+}
+
+const svelteServer = (root) => resolveFrom([root], 'svelte-language-server/bin/server.js') ?? resolveFrom([globalModules().dir], 'svelte-language-server/bin/server.js');
 
 const PLATFORM_PACKAGE = `@typescript/typescript-${process.platform}-${process.arch}`;
 const major = (version) => Number(version?.split('.')[0]);
@@ -162,8 +180,9 @@ const packageAt = (dir, name) => {
 // rustup's proxy): the platform package's binary is started directly, found as
 // typescript/lib/getExePath.js finds it.
 function typescript7(root) {
+	const ts7 = (p) => (major(p?.version) >= 7 ? p : null);
 	const project = packageAt(root, 'typescript');
-	const found = [project, packageAt(root, '@typescript/native'), packageAt(globalModules(), 'typescript')].find((p) => major(p?.version) >= 7);
+	const found = ts7(project) ?? ts7(packageAt(root, '@typescript/native')) ?? ts7(packageAt(globalModules().dir, 'typescript'));
 	if (!found) return null;
 	const native = resolveFrom([found.dir], `${PLATFORM_PACKAGE}/package.json`);
 	return { ...found, exe: native && join(dirname(native), 'lib', process.platform === 'win32' ? 'tsc.exe' : 'tsc'), project: project?.version };
@@ -171,7 +190,7 @@ function typescript7(root) {
 
 function typescriptServer(root) {
 	const ts = typescript7(root);
-	if (!ts) throw new Error('TypeScript 7 not found (npm install -g typescript@7)');
+	if (!ts) throw new Error(`TypeScript 7 not found in the project${npmGlobal.error ? ` (and ${npmGlobal.error})` : ` or ${npmGlobal.dir}`}: npm install -g typescript@7`);
 	if (!ts.exe) throw new Error(`TypeScript ${ts.version} in ${ts.dir} lacks its platform package ${PLATFORM_PACKAGE}`);
 	const note = major(ts.project) < 7 ? `the project has TypeScript ${ts.project}; TypeScript ${ts.version} from ${ts.dir} serves it` : undefined;
 	return { command: ts.exe, args: ['--lsp', '--stdio'], note };

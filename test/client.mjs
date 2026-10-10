@@ -2,13 +2,22 @@
 // every server->client request answered null) and keeps the lsp-kit log lines
 // the proxy relays from its manager.
 import { execFileSync, execSync, spawn } from 'node:child_process';
-import { readlinkSync } from 'node:fs';
-import { basename } from 'node:path';
+import { mkdirSync, readlinkSync, rmSync } from 'node:fs';
+import { basename, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const t0 = Date.now();
 export const log = (m) => console.log(`+${((Date.now() - t0) / 1000).toFixed(1)}s ${m}`);
 export const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// The test's scratch folder, emptied. The plugin data (manager logs, the npm
+// lookup cache) goes under it, never into the machine's temp folder.
+export function scratch(dir) {
+	rmSync(dir, { recursive: true, force: true });
+	mkdirSync(dir, { recursive: true });
+	process.env.CLAUDE_PLUGIN_DATA = join(dir, 'plugin-data');
+	return dir;
+}
 
 // Every proxy joins a private manager (LSP_KIT_PIPE), never the machine's real
 // one; finish() kills each manager the test's proxies joined, and with it its servers.

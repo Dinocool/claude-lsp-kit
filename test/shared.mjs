@@ -7,14 +7,14 @@
 // away; the manager survives a tree kill of the proxy that started it.
 // Usage: node test/shared.mjs <scratchDir>   (needs lua-language-server and git)
 import { execSync } from 'node:child_process';
-import { mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from 'node:fs';
 import { connect } from 'node:net';
 import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { pipePath, readFrames } from '../plugins/lsp-kit/rpc.mjs';
-import { alive, check, finish, killManager, log, managerProcesses, privatePipe, startProxy, wait } from './client.mjs';
+import { alive, check, finish, killManager, log, managerProcesses, privatePipe, scratch, startProxy, wait } from './client.mjs';
 
-rmSync(process.argv[2], { recursive: true, force: true });
+scratch(process.argv[2]);
 mkdirSync(join(process.argv[2], 'repo'), { recursive: true });
 const base = realpathSync.native(process.argv[2]);
 const repo = join(base, 'repo');

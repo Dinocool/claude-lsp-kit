@@ -12,14 +12,14 @@ import { mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSy
 import { basename, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { LANGUAGES } from '../plugins/lsp-kit/languages.mjs';
-import { alive, check, finish, killManager, log, privatePipe, processPath, startProxy, wait } from './client.mjs';
+import { alive, check, finish, killManager, log, privatePipe, processPath, scratch, startProxy, wait } from './client.mjs';
 
-rmSync(process.argv[2], { recursive: true, force: true });
+scratch(process.argv[2]);
 mkdirSync(join(process.argv[2], 'repo'), { recursive: true });
 const base = realpathSync.native(process.argv[2]); // the spelling the manager logs
 const repo = join(base, 'repo');
-// No global TypeScript: npm's global folder (`npm root -g`) follows the prefix setting.
-mkdirSync(join(base, 'empty-prefix'));
+// No global TypeScript: npm's global folder follows the prefix setting.
+mkdirSync(join(base, 'empty-prefix', process.platform === 'win32' ? '' : 'lib', 'node_modules'), { recursive: true });
 process.env.npm_config_prefix = join(base, 'empty-prefix');
 const sh = (c) => execSync(c, { cwd: repo, stdio: 'pipe' }).toString().trim();
 const write = (file, text) => (mkdirSync(join(repo, file, '..'), { recursive: true }), writeFileSync(join(repo, file), text));
@@ -188,5 +188,38 @@ try {
 	startError = e.message;
 }
 check(startError?.includes(`lacks its platform package @typescript/typescript-${process.platform}-${process.arch}`), `a TypeScript 7 without its platform package: ${startError}`);
+
+// ---- npm's global folder ----------------------------------------------------------------
+// Under a UUID-named folder, as Claude's temp folder is: npm prints such segments
+// as `***`, yet the global TypeScript 7 there serves a project without one.
+const prefix = join(base, 'c8f5abe6-607d-45f5-b2b5-1f57263ef57a', 'prefix');
+const globalDir = join(prefix, process.platform === 'win32' ? '' : 'lib', 'node_modules');
+mkdirSync(join(globalDir, '@typescript'), { recursive: true });
+symlinkSync(join(repo, 'node_modules', 'typescript'), join(globalDir, 'typescript'), 'junction');
+symlinkSync(join(repo, 'node_modules', platform), join(globalDir, platform), 'junction');
+const plain = join(base, 'plain');
+mkdirSync(join(plain, 'src'), { recursive: true });
+writeFileSync(join(plain, 'package.json'), '{ "name": "plain", "private": true }\n');
+writeFileSync(join(plain, 'src', 'a.ts'), 'export const a = 1;\nexport const b = a;\n');
+const gEnv = { LSP_KIT_PIPE: privatePipe(), npm_config_prefix: prefix, CLAUDE_PLUGIN_DATA: join(base, 'global-data') };
+const g = startProxy('typescript', plain, { ...gEnv, name: 'global' });
+await g.initialize(plain);
+const npmLine = readFileSync(join(gEnv.CLAUDE_PLUGIN_DATA, `${gEnv.LSP_KIT_PIPE}.log`), 'utf8').split('\n').find((l) => l.includes('global folder'));
+check(npmLine?.endsWith(`npm's global folder: ${globalDir}`), `the manager reads npm's global folder under a UUID-named folder: ${npmLine}`);
+const aUri = pathToFileURL(join(plain, 'src', 'a.ts')).href;
+let def;
+for (let i = 0; i < 40 && !def?.length; i++, await wait(250)) def = await g.req('textDocument/definition', { textDocument: { uri: aUri }, position: { line: 1, character: 17 } });
+check(def?.[0]?.range?.start.line === 0, `the global TypeScript 7 there serves the project: ${JSON.stringify(def)}`);
+await g.close();
+killManager(g.manager);
+// A global folder that doesn't exist is a failed lookup, named in the start error.
+const missing = join(base, 'no-such-prefix');
+const m = startProxy('typescript', plain, { npm_config_prefix: missing, CLAUDE_PLUGIN_DATA: join(base, 'missing-data'), name: 'missing' });
+await m.initialize(plain);
+const answer = await m.req('textDocument/hover', { textDocument: { uri: aUri }, position: { line: 0, character: 13 } });
+const missingDir = join(missing, process.platform === 'win32' ? '' : 'lib', 'node_modules');
+check(answer?.error?.includes(`npm's global folder ${missingDir} doesn't exist`), `a missing global folder is named in the start error: ${answer?.error}`);
+await m.close();
+killManager(m.manager);
 log(`scratch: ${repo}`);
 finish();
