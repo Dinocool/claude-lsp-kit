@@ -58,6 +58,19 @@ export const LANGUAGES = {
 		note: 'scope and runtime from the project .luarc.json; documentSymbol outlines functions and file-level tables, not locals inside functions (workspaceSymbol finds those by name)',
 		watch: ['.lua'],
 		server: () => ({ command: 'lua-language-server', args: [] }),
+		// A TMP and TEMP of the server's own (the manager makes the folder). On
+		// Windows, LuaLS's runtime bee.lua makes every socket pair by listening on
+		// one fixed path, %TEMP%\bee1.tmp (unnamed_unix_bind: GetTempFileNameW with
+		// uUnique 1, the file deleted before each bind), so two LuaLS processes
+		// making a pair at once take it from each other. The loser either waits
+		// for good (pair's select has no timeout) or exits on "Duplicate channel
+		// 'task:1'": channelmgr::create returns null for a failed pair as for a
+		// duplicate name. Measured: 17 of 120 simultaneous starts exited so, none
+		// with a TMP each (GetTempPathW reads TMP, then TEMP). Sources:
+		// https://github.com/actboy168/bee.lua/blob/master/bee/net/socket.cpp
+		// https://github.com/actboy168/bee.lua/blob/master/binding/lua_channel.cpp
+		// https://learn.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-gettemppathw
+		env: (dir) => ({ TMP: dir, TEMP: dir }),
 		results: { 'textDocument/documentSymbol': luaOutline },
 		// Without a .luarc.json bounding the workspace, LuaLS scans every file under the root.
 		present: (root) => existsSync(join(root, '.luarc.json')) || existsSync(join(root, '.luarc.jsonc')),

@@ -162,6 +162,12 @@ checkout, pids and the gone manager.
   later process that reuses the pid is never stopped.
 - A server lsp-kit didn't start, such as an editor's own rust-analyzer, is
   never stopped. It isn't in any record.
+- A record also lists its servers' own folders (LuaLS's `TMP`, see
+  Per-language setup), written before each server starts. A server's folder
+  goes when it stops; the sweep removes a gone manager's after stopping its
+  processes. Only folders named `lsp-kit-server-dir-<user>-…` in the data
+  directory are removed, and one still in use keeps its record for the next
+  sweep.
 - A record is removed only once its manager is gone. One that can't be read
   is logged and left in place.
 - A record that can't be written is logged, and the next measurement tries
@@ -245,6 +251,14 @@ checkout, pids and the gone manager.
   outline: functions, methods, file-level variables and table fields, plus
   functions named inside function bodies, with their ranges.
   `workspaceSymbol` is not trimmed, so it still finds locals by name.
+  - Each LuaLS server gets a `TMP` and `TEMP` folder of its own in the plugin
+    data directory. On Windows, LuaLS's runtime
+    ([bee.lua](https://github.com/actboy168/bee.lua/blob/master/bee/net/socket.cpp))
+    makes every internal socket pair through one fixed file,
+    `%TEMP%\bee1.tmp`. Two LuaLS processes doing so at once collide, and the
+    loser hangs or exits with "Duplicate channel 'task:1'". In a trial, 17 of
+    120 servers started together exited that way. With a folder each, none
+    did. Two checkouts whose Lua servers start together are enough to hit it.
 
 If a server isn't installed, `initialize` and each later request fail with a
 message that names it.
@@ -447,6 +461,11 @@ started with, and with it its manager.
 - `node test/roots.mjs <scratchDir>` checks a session started in a
   subdirectory roots Lua at the git toplevel (`.luarc.json` applies), a
   sibling worktree gets its own server, and the Lua outline.
+- `node test/start-race.mjs <scratchDir>` starts eight Lua servers at the
+  same instant, ten rounds, each on a new manager. It checks every one
+  answers, each live server has one folder of its own, and the next
+  manager's sweep removes the folders of a killed one. A server that stops
+  when idle removes its own.
 - `node tools/settings-trial.mjs <rust|lua> <root> <scratchDir> <file>... [--runs n]`
   is no test: it runs each candidate setting on `<root>` and prints the
   table in [Settings](#settings). `<file>`s are the lookups' source and the

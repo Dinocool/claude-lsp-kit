@@ -21,7 +21,8 @@
 //    .claude/worktrees/<name>, or a sibling directory), so an agent's LSP calls
 //    see its worktree's code, not main's.
 // 4. Per-language setup from languages.mjs (server command, initialization
-//    options such as rust-analyzer's linkedProjects for nested crates, response
+//    options such as rust-analyzer's linkedProjects for nested crates,
+//    environment such as LuaLS's TMP in a folder of its own, response
 //    rewrites such as the Lua documentSymbol outline).
 //
 // Lifecycle, one rule for every server: it starts on the first request for its
@@ -61,7 +62,7 @@ import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realp
 import { connect, createServer } from 'node:net';
 import { userInfo } from 'node:os';
 import { createInterface } from 'node:readline';
-import { dirname, extname, isAbsolute, join, relative, sep } from 'node:path';
+import { basename, dirname, extname, isAbsolute, join, relative, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { LANGUAGES, askNpm, gitRoot } from './languages.mjs';
 import { processes, sameProcess, tree } from './processes.mjs';
@@ -167,11 +168,16 @@ listener.listen(PIPE, () => {
 //   reads another process's environment: RTL_USER_PROCESS_PARAMETERS documents
 //   only ImagePathName and CommandLine), and a marker argument breaks servers
 //   that reject unknown ones.
+// - A server's own folder (a language's env hook, see startServer) is recorded
+//   before its spawn and removed when it closes; the sweep removes those of a
+//   gone manager after stopping its processes.
 const RECORDS = `lsp-kit-servers-${userInfo().username}-`;
+const SERVER_DIRS = `lsp-kit-server-dir-${userInfo().username}-`;
 const ID = randomUUID();
 const RECORD = join(dir, `${RECORDS}${ID}.json`);
 const RECORD_ID = 'lsp-kit/record-id'; // another manager's liveness probe (see gone), answered with ID
 const owned = new Map(); // pid -> { pid, created, lang, root, server (its server's pid) }, while it lives
+const serverDirs = new Set(); // the live servers' own folders
 let saved = '';
 
 // Lists the processes and records every running server's tree; resolves to the listing.
@@ -190,7 +196,7 @@ function record() {
 // A write that fails (Windows refuses a rename while another process reads the
 // file) is retried by the next record, never fatal to the manager.
 function saveRecord() {
-	const text = owned.size ? JSON.stringify({ id: ID, pipe: PIPE, pid: process.pid, processes: [...owned.values()] }) : '';
+	const text = owned.size || serverDirs.size ? JSON.stringify({ id: ID, pipe: PIPE, pid: process.pid, processes: [...owned.values()], dirs: [...serverDirs] }) : '';
 	if (text === saved) return;
 	try {
 		if (!text) rmSync(RECORD, { force: true });
@@ -256,12 +262,29 @@ async function sweep() {
 			}
 			log(`stopped what was left of a ${lang} server for ${root} (server pid ${server}): pids ${[...pids].join(', ')}; its manager pid ${rec.pid} is gone`);
 		}
+		// Only a server folder in the data dir: a record is a file anyone can write.
+		const dirs = (rec.dirs ?? []).filter((d) => typeof d === 'string' && basename(d).startsWith(SERVER_DIRS) && join(dir, basename(d)) === d);
+		if (!dirs.map(removeServerDir).every(Boolean)) continue;
 		try {
 			rmSync(join(dir, file), { force: true });
 		} catch (e) {
 			log(`server record ${file} not removed: ${e.message}`);
 		}
 	}
+}
+
+// A folder that can't be removed yet (a process still holds a file in it)
+// stays recorded: this manager's for the sweep after it is gone, a gone
+// manager's for the next sweep. False when it stays.
+function removeServerDir(d) {
+	try {
+		rmSync(d, { recursive: true, force: true });
+	} catch (e) {
+		log(`server folder ${d} not removed: ${e.message}`);
+		return false;
+	}
+	if (serverDirs.delete(d)) saveRecord();
+	return true;
 }
 
 // ---- servers ------------------------------------------------------------------
@@ -280,7 +303,14 @@ function startServer(session, root, key, shareKey) {
 		// can't be deleted, which would block removing the worktree. Servers take
 		// their root from rootUri. windowsHide: the manager has no console, so
 		// without it each server would get a visible console window of its own.
-		server.child = spawn(command, args, { stdio: 'pipe', windowsHide: true });
+		// A language's env hook (languages.mjs) gets a folder of the server's own.
+		if (lang.env) {
+			server.ownDir = join(dir, `${SERVER_DIRS}${ID}-${server.no}`);
+			mkdirSync(server.ownDir, { recursive: true });
+			serverDirs.add(server.ownDir);
+			saveRecord();
+		}
+		server.child = spawn(command, args, { stdio: 'pipe', windowsHide: true, env: { ...process.env, ...lang.env?.(server.ownDir) } });
 		server.child.on('error', (e) => (server.startError = e.message));
 		server.child.stdin.on('error', () => {}); // a write racing the child's exit; 'close' cleans up
 		server.child.on('close', (code) => serverClosed(server, code));
@@ -332,6 +362,7 @@ function serverClosed(server, code) {
 	server.closed = true;
 	running.delete(server);
 	drop(server);
+	if (server.ownDir) removeServerDir(server.ownDir);
 	server.exitMessage = `lsp-kit: ${server.lang.name} server #${server.no} for ${server.root} ${server.startError ? `could not start: ${server.startError}` : `exited (code ${code})`}`;
 	for (const entry of server.requests) settle(entry, { error: { code: -32603, message: server.exitMessage } });
 	for (const resolve of server.waiting.values()) resolve(null);
