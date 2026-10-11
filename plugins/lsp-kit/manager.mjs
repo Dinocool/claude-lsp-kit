@@ -33,8 +33,9 @@
 // tick. A server in use (a request in flight, or used within the last reaper
 // tick) is never stopped; if every one is, the cap or limit is exceeded and
 // logged. A server that exits is dropped, and the next request for its
-// checkout starts a fresh one (LSP 3.17: `initialize` goes once per process). The manager itself exits once it has neither
-// sessions nor servers; a session's exit only releases its documents.
+// checkout starts a fresh one (LSP 3.17: `initialize` goes once per process).
+// The manager itself exits once it has neither sessions nor servers; a
+// session's exit only releases its documents.
 //
 // Sessions, the LSP 3.17 client side of each server:
 // - Ids: a session's request goes to the server under a manager id and its
