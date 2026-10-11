@@ -84,8 +84,10 @@ const MAX_MEMORY = (Number(process.env.LSP_KIT_MAX_MEMORY_MB) || 6 * 1024) * 2 *
 // server is never refused for it; only idle ones stop. A fixed floor would be
 // crossed all the time on a small machine, and on macOS, whose free memory
 // leaves out cached and inactive pages: the default is an eighth of the
-// machine's memory (8 GB of 64). LSP_KIT_MIN_FREE_MB=0 turns it off.
-const MIN_FREE = process.env.LSP_KIT_MIN_FREE_MB ? Number(process.env.LSP_KIT_MIN_FREE_MB) * 2 ** 20 : totalmem() / 8;
+// machine's memory (8 GB of 64). LSP_KIT_MIN_FREE_MB=0 turns it off; a value
+// that isn't a number leaves the default, as the other settings do.
+const minFreeMb = process.env.LSP_KIT_MIN_FREE_MB?.trim() ? Number(process.env.LSP_KIT_MIN_FREE_MB) : NaN;
+const MIN_FREE = Number.isFinite(minFreeMb) ? minFreeMb * 2 ** 20 : totalmem() / 8;
 const MEMORY_LOG_CHANGE = 0.1; // a server's memory is logged again once it moves this much
 const size = (bytes) => (bytes < 2 ** 30 ? `${Math.round(bytes / 2 ** 20)} MB` : `${(bytes / 2 ** 30).toFixed(1)} GB`);
 const IDLE_MS = Number(process.env.LSP_KIT_IDLE_MS) || 5 * 60 * 1000;
@@ -454,8 +456,12 @@ function makeRoom() {
 // no exception: it can't fit beside any other, and a leak that size is what the
 // limit is for. It stops whenever it is not in use, after any idle server
 // used less recently, and the log says so once, loudly.
+// A measurement still running when the next tick comes (a slow process listing)
+// skips that tick's: two would race to record and to stop servers.
+let measuring = false;
 function measure() {
-	if (!servers.size) return;
+	if (!servers.size || measuring) return;
+	measuring = true;
 	record().then(
 		(list) => {
 			for (const s of [...servers.values()].filter((s) => list.has(s.child?.pid))) {
@@ -474,7 +480,7 @@ function measure() {
 				log(`every server left is in use: their ${size(total())} exceed the memory limit of ${size(MAX_MEMORY)}`);
 		},
 		(e) => log(`memory not measured, so its limit wasn't applied and its servers not recorded this time: ${e.message}`)
-	);
+	).finally(() => (measuring = false));
 }
 
 // The idle check runs from the manager's start (listening) on and counts every

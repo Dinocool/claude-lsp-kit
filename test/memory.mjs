@@ -63,6 +63,17 @@ const bytes = (n, unit) => Number(n) * 2 ** (unit === 'GB' ? 30 : 20);
 const limited = { LSP_KIT_PIPE: privatePipe(), LSP_KIT_MAX_MEMORY_MB: '1', LSP_KIT_IDLE_MS: '20000', STUB_HELPER: '1' };
 const lua = startProxy('lua', repo, { ...limited, name: 'lua' });
 await lua.initialize(repo);
+// Its floor is the tests' 0 (client.mjs): off. One that isn't a number leaves the default.
+const data = process.env.CLAUDE_PLUGIN_DATA;
+const managerLog = (pipe) => readFileSync(join(data, `${pipe}.log`), 'utf8');
+const floorOf = (pipe) => /, free memory floor ([^,]+), /.exec(managerLog(pipe))?.[1];
+check(floorOf(limited.LSP_KIT_PIPE) === 'off', `LSP_KIT_MIN_FREE_MB=0 turns the floor off (${floorOf(limited.LSP_KIT_PIPE)})`);
+const junkEnv = { LSP_KIT_PIPE: privatePipe(), LSP_KIT_MIN_FREE_MB: 'lots' };
+const junk = startProxy('lua', repo, { ...junkEnv, name: 'junk' });
+await junk.initialize(repo);
+const eighth = `${(totalmem() / 8 / 2 ** 30).toFixed(1)} GB`;
+check(floorOf(junkEnv.LSP_KIT_PIPE) === eighth, `a floor that isn't a number leaves the default, an eighth of the machine's memory (${floorOf(junkEnv.LSP_KIT_PIPE)}, expected ${eighth})`);
+await junk.close();
 check((await refs(lua, repo)) === '3 refs', 'Lua server #1 (the main checkout) answers');
 check((await refs(lua, wt)) === '3 refs', 'Lua server #2 (the worktree) answers, used after #1');
 const svelte = startProxy('svelte', repo, { ...limited, name: 'svelte' });
@@ -131,8 +142,6 @@ try {
 // ---- leftover servers -------------------------------------------------------------
 // The stub and its helper were recorded. Killing their manager kills the stub
 // on Windows (its job object), not elsewhere; the helper survives either way.
-const data = process.env.CLAUDE_PLUGIN_DATA;
-const managerLog = (pipe) => readFileSync(join(data, `${pipe}.log`), 'utf8');
 const records = () => readdirSync(data).filter((f) => f.startsWith(RECORDS) && f.endsWith('.json'));
 const recordOf = (pipe) => records().find((f) => JSON.parse(readFileSync(join(data, f), 'utf8')).pipe === pipePath(pipe, data));
 const stubPid = Number(svelte.stderr.map((l) => /Svelte server #\d+ for .* pid (\d+)\)$/.exec(l)?.[1]).find(Boolean));

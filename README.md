@@ -482,11 +482,11 @@ started with, and with it its manager.
   worktree's server, and removes a worktree while its server runs. It checks
   no console window shows for the manager or its servers (Windows), that
   killing the manager stops every server, and the machine-wide cap across
-  two sessions (least recently used first, never one in use). The session's server stops when idle (one server per checkout
-  however a request spells it), and a manager left alone exits, never
-  before it has accepted the session that started it (its npm lookup made
-  slower than the idle stop) and never while a connection that hasn't said
-  hello is open. A server that can't start answers with the reason.
+  two sessions (least recently used first, never one in use). The session's
+  server stops when idle (one server per checkout however a request spells
+  it), and a manager left alone exits, never before it has accepted the
+  session that started it (its npm lookup made slower than the idle stop)
+  and never while a connection that hasn't said hello is open. A server that can't start answers with the reason.
 - `node test/memory.mjs <scratchDir>` sets a 1 MB limit. It checks that the
   least recently used idle Lua server stops first, then the next. A stub
   server with a request in flight never stops, and the limit is exceeded and
@@ -496,9 +496,10 @@ started with, and with it its manager.
   server used within the last check, and none in a check that stopped a
   server whose directory is gone. Above the floor, none stops. The tests'
   other managers run with the floor off, so the machine's own free memory
-  never stops their servers. Then it kills the stub's manager: the stub's
-  helper process (and the stub, off Windows) outlives it. The next manager's start stops
-  them and logs it. A look-alike lsp-kit didn't start, the same program also
+  never stops their servers: `LSP_KIT_MIN_FREE_MB=0` turns it off, and a
+  value that isn't a number leaves the default. Then it kills the stub's
+  manager: the stub's helper process (and the stub, off Windows) outlives
+  it. The next manager's start stops them and logs it. A look-alike lsp-kit didn't start, the same program also
   without a live parent, keeps running, even with a gone manager's record
   naming its pid. So do a live manager's server and its record. A record
   naming the new manager's own pipe under another id is swept. With file
