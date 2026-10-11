@@ -8,13 +8,15 @@
 // reason, and the next message reconnects (starting a new manager) and replays
 // the session's `initialize` params in the hello. A manager that can't be
 // started or reached fails each request with the reason: there is no
-// per-session fallback.
+// per-session fallback. Each response is shaped for the client before it is
+// written out (shape.mjs).
 import { spawn } from 'node:child_process';
 import { connect } from 'node:net';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { LANGUAGES } from './languages.mjs';
 import { endpoint, frame, readFrames } from './rpc.mjs';
+import { shape } from './shape.mjs';
 
 if (!LANGUAGES[process.argv[2]]) throw new Error(`lsp-kit: unknown language "${process.argv[2]}"`);
 const CONNECT_MS = 10 * 1000; // a manager it started gets this long to listen
@@ -23,7 +25,7 @@ const launcher = fileURLToPath(new URL('./launch.mjs', import.meta.url)); // sta
 let init = null; // the client's initialize params, replayed to every new manager
 let shutdownReceived = false;
 let link = null; // the manager connection: a promise of the socket while connecting or connected
-const unanswered = new Set(); // client request ids sent to the current manager
+const unanswered = new Map(); // client request id -> method, sent to the current manager
 
 const toClient = (msg) => process.stdout.write(frame(msg));
 const fail = (id, message) => toClient({ jsonrpc: '2.0', id, error: { code: -32603, message: `lsp-kit: ${message}` } });
@@ -39,7 +41,7 @@ readFrames(process.stdin, (msg) => {
 		throw e;
 	});
 	link.then(
-		(socket) => (request && unanswered.add(msg.id), socket.write(frame(msg))),
+		(socket) => (request && unanswered.set(msg.id, msg.method), socket.write(frame(msg))),
 		(e) => (request ? fail(msg.id, e.message) : process.stderr.write(`lsp-kit: ${msg.method ?? 'response'} dropped: ${e.message}\n`))
 	);
 });
@@ -58,12 +60,18 @@ async function open() {
 	socket.on('error', () => {}); // 'close' follows
 	socket.on('close', () => {
 		link = null;
-		for (const id of unanswered) fail(id, 'the manager exited before answering; the next request starts a new one');
+		for (const id of unanswered.keys()) fail(id, 'the manager exited before answering; the next request starts a new one');
 		unanswered.clear();
 	});
 	readFrames(socket, (msg) => {
 		if (msg.method === 'lsp-kit/log') return void process.stderr.write(msg.params.line + '\n');
-		if (msg.id != null && !msg.method) unanswered.delete(msg.id);
+		if (msg.id != null && !msg.method) {
+			// Shape the answer before the client renders it (shape.mjs); the method
+			// comes from the request this answers.
+			const method = unanswered.get(msg.id);
+			unanswered.delete(msg.id);
+			if (method && !msg.error) msg.result = shape(method, msg.result);
+		}
 		toClient(msg);
 	});
 	socket.write(frame({ jsonrpc: '2.0', method: 'lsp-kit/hello', params: { language: process.argv[2], cwd: process.cwd(), pid: process.pid, initialize: init } }));

@@ -46,6 +46,7 @@ const TS_NOTE = 'TypeScript and JavaScript (.ts, .mts, .cts, .tsx, .js, .mjs, .c
 typescript('6.0.3');
 const note = run('SessionStart', {});
 check(note?.startsWith(DEFERRED + " The LSP tool serves this project's Lua") && !note.includes('TypeScript'), 'SessionStart opens with how to load the deferred LSP tool; Lua only under TypeScript 6');
+check(note?.includes('Read takes offset/limit for exact line ranges'), 'SessionStart advertises Read offset/limit for exact line ranges');
 check(run('SubagentStart', { agent_type: 'general-purpose' })?.startsWith(DEFERRED), 'SubagentStart opens with it too');
 check(grep({ pattern: 'helper' }) === HINT, 'Grep of an identifier over the project: hint');
 check(grep({ pattern: '\\bhelper\\b', glob: '*.lua' }) === HINT, 'Grep of an identifier over *.lua: hint');

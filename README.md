@@ -17,7 +17,7 @@ shares each server among all sessions on the machine.
 The language servers run in one manager process per machine
 (`plugins/lsp-kit/manager.mjs`), which every Claude Code session reaches
 through a small stdio proxy (`plugins/lsp-kit/proxy.mjs`); no dependencies. It
-fixes five things.
+fixes six things.
 
 **1. Whole-repo watcher fallbacks.** Claude Code's LSP client doesn't advertise
 `workspace.didChangeWatchedFiles`. Without it, `svelte-language-server` starts
@@ -250,7 +250,8 @@ checkout, pids and the gone manager.
   `documentSymbol` lists every local, parameter and `if` block of every
   function (1,500 entries for a 1,900-line file); lsp-kit trims it to an
   outline: functions, methods, file-level variables and table fields, plus
-  functions named inside function bodies, with their ranges.
+  functions named inside function bodies, with their ranges; the proxy's
+  response shaping (6) then drops the fields deeper than file level.
   `workspaceSymbol` is not trimmed, so it still finds locals by name.
   - Each LuaLS server gets a `TMP` and `TEMP` folder of its own in the plugin
     data directory. On Windows, LuaLS's runtime
@@ -267,6 +268,16 @@ checkout, pids and the gone manager.
 
 If a server isn't installed, `initialize` and each later request fail with a
 message that names it.
+
+**6. Response shaping.** The proxy shapes each answer before the client renders
+it, cutting what the rendering spends tokens on without losing anything a
+ranged Read can't recover: `documentSymbol` outlines keep navigational symbols
+(functions, methods, classes, structs, interfaces, enums, modules) at any
+depth, and other kinds only at file level or while they still lead to a kept
+child (a table that holds functions stays with them); references, definition,
+implementation, declaration and typeDefinition answers are deduped and sorted
+by uri and position, never capped (the client prints its own count header);
+`hover` passes through. `LSPKIT_RAW=1` turns shaping off for that session.
 
 ## Settings
 
@@ -333,7 +344,8 @@ The plugin's hooks only add context and never block a tool call:
   this project, then explains when to use `documentSymbol`, `goToDefinition`,
   `findReferences`, `hover`, call hierarchy and `workspaceSymbol` instead of
   Grep or whole-file Read, and for a large file to prefer `workspaceSymbol`
-  with a query or `findReferences` from a known line. A language is listed
+  with a query or `findReferences` from a known line, and that `Read` takes
+  `offset`/`limit` for exact line ranges. A language is listed
   only if its project marker (in the table above) is present at the repo
   root and its server is installed.
 - **Grep:** when the pattern is a bare identifier searched over a served
@@ -404,6 +416,8 @@ started with, and with it its manager.
 
   A running manager keeps the values it started with: end it (its pid is in
   the log) to apply new ones.
+- `LSPKIT_RAW=1` turns response shaping off for that session; the proxy reads
+  it, not the manager (see Response shaping).
 - `node test/smoke.mjs <svelte|typescript|rust|lua> <root> <hover|references|documentSymbol|definition> <file:line:col>...`
   drives the proxy like Claude Code does, on a private manager.
 - Each test below builds a throwaway project under `<scratchDir>`, runs its
@@ -411,6 +425,12 @@ started with, and with it its manager.
   need a `<scratchDir>` of at most 60 characters (see the Lua socket path):
 - `node test/hooks.mjs <scratchDir>` checks what the hooks add, with a
   stub TypeScript 6 (not served) and then 7, and an empty npm global folder.
+- `node test/shape.mjs <scratchDir>` checks response shaping: the
+  documentSymbol outline rule and the location dedupe/sort on synthetic
+  payloads, then one real Lua answer raw beside shaped.
+- `node tools/measure-shaping.mjs <scratchDir>` is no test: it runs a fixed
+  query set on generated Lua fixtures through the proxy, raw (LSPKIT_RAW=1)
+  and shaped, and prints each answer's byte size before and after.
 - `node test/shared.mjs <scratchDir>` checks two sessions on one checkout
   share one server and each sees its own spelling of it. It checks documents
   stay open until the last session closes them or its proxy is killed, and

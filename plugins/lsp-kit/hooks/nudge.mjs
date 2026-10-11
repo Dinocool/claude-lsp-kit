@@ -45,6 +45,7 @@ function sessionNote() {
 		`documentSymbol = a file outline with line numbers (then Read only the ranges you need; ${LARGE_FILE_TIP}); ` +
 		'goToDefinition / findReferences / hover / incomingCalls / outgoingCalls at a symbol position; ' +
 		'workspaceSymbol with a query = find a function, type or table by name. ' +
+		'Read takes offset/limit for exact line ranges: peek at the lines an outline names, not the whole file. ' +
 		'LSP calls on files inside a git worktree are answered by a server for that worktree. Grep is for text, not symbols.'
 	);
 }
