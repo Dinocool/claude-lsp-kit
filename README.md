@@ -271,20 +271,24 @@ message that names it.
 
 **6. Response shaping.** The proxy shapes each answer before the client renders
 it, cutting what the rendering spends tokens on without losing anything a
-ranged Read can't recover: `documentSymbol` outlines keep navigational symbols
-(functions, methods, classes, structs, interfaces, enums, modules) at any
-depth, and other kinds only at file level or while they still lead to a kept
-child (a table that holds functions stays with them); references, definition,
-implementation, declaration and typeDefinition answers are deduped and sorted
-by uri and position, never capped (the client prints its own count header);
-`hover` passes through. `LSPKIT_RAW=1` turns shaping off for that session.
+ranged Read can't recover: `documentSymbol` outlines keep every symbol at file
+level, navigational kinds (namespaces, modules, classes, methods,
+constructors, enums, interfaces, functions, structs) at any depth, the members
+of a type declaration (class, interface, struct, enum) whatever their kind,
+and any symbol that still leads to a kept child (a table that holds functions
+stays with them); other kinds below file level go (a plain field at depth 2 is
+recoverable by a ranged Read). references, definition, implementation,
+declaration and typeDefinition answers are deduped, keeping the server's
+order, and never capped (the client prints its own count header); `hover`
+passes through. `LSPKIT_RAW=1` turns shaping off for that session.
 
 Diagnostics are gated the same way: a `publishDiagnostics` reaches the client
-only for a document the session has opened (`didOpen` minus `didClose`). The
-shared manager runs servers for every session's worktree, and whole-project
-pushes for files a session never looked at are other sessions' churn rendering
-into its context — measured at 92% of one session's diagnostic bytes. The same
-`LSPKIT_RAW=1` switch forwards every push.
+for a document the session has opened (`didOpen` minus `didClose`, matched by
+file path however the uri is spelled), and an empty push — a clear — always
+passes. The shared manager runs servers for every session's worktree, and
+whole-project pushes for files a session never looked at are other sessions'
+churn rendering into its context — measured at 92% of one session's diagnostic
+bytes. The same `LSPKIT_RAW=1` switch forwards every push.
 
 ## Settings
 
@@ -433,7 +437,7 @@ started with, and with it its manager.
 - `node test/hooks.mjs <scratchDir>` checks what the hooks add, with a
   stub TypeScript 6 (not served) and then 7, and an empty npm global folder.
 - `node test/shape.mjs <scratchDir>` checks response shaping: the
-  documentSymbol outline rule and the location dedupe/sort on synthetic
+  documentSymbol outline rule and the location dedupe on synthetic
   payloads, then one real Lua answer raw beside shaped.
 - `node tools/measure-shaping.mjs <scratchDir>` is no test: it runs a fixed
   query set on generated Lua fixtures through the proxy, raw (LSPKIT_RAW=1)

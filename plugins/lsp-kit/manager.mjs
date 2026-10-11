@@ -66,7 +66,7 @@ import { basename, dirname, extname, isAbsolute, join, relative, sep } from 'nod
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { LANGUAGES, askNpm, gitRoot } from './languages.mjs';
 import { processes, sameProcess, tree } from './processes.mjs';
-import { endpoint, frame, readFrames } from './rpc.mjs';
+import { docKey, endpoint, frame, readFrames } from './rpc.mjs';
 
 // Machine-wide, across sessions and languages. The cap stops a server only when
 // MAX_SERVERS checkouts used more recently (the one starting included) need
@@ -529,13 +529,6 @@ function respellAll(value, from, to) {
 }
 const withDocUri = (params, uri) =>
 	params.textDocument ? { ...params, textDocument: { ...params.textDocument, uri } } : { ...params, item: { ...params.item, uri } };
-// A server's documents are keyed by path (servers may spell a URI differently
-// in diagnostics), case-folded where the file system is.
-const docKey = (uri) => {
-	if (!uri.startsWith('file:')) return uri;
-	const path = fileURLToPath(uri);
-	return process.platform === 'win32' || process.platform === 'darwin' ? path.toLowerCase() : path;
-};
 
 // ---- sessions -> servers ------------------------------------------------------
 

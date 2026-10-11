@@ -15,7 +15,7 @@ import { connect } from 'node:net';
 import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { LANGUAGES } from './languages.mjs';
-import { endpoint, frame, readFrames } from './rpc.mjs';
+import { docKey, endpoint, frame, readFrames } from './rpc.mjs';
 import { shape } from './shape.mjs';
 
 if (!LANGUAGES[process.argv[2]]) throw new Error(`lsp-kit: unknown language "${process.argv[2]}"`);
@@ -26,14 +26,16 @@ let init = null; // the client's initialize params, replayed to every new manage
 let shutdownReceived = false;
 let link = null; // the manager connection: a promise of the socket while connecting or connected
 const unanswered = new Map(); // client request id -> method, sent to the current manager
-// Documents this session has open (didOpen minus didClose). A server pushes
-// diagnostics for whole projects, and the shared manager runs servers for every
-// session's worktree: pushes for documents this session never opened are other
-// sessions' churn, which the client renders into this session's context all
-// the same (measured 2026-10-11: 92% of a session's diagnostic bytes were
-// never-opened files in other agents' worktrees). Forward a
-// publishDiagnostics only for an open document; LSPKIT_RAW=1 passes every
-// push through, the same switch as shape.mjs.
+// Documents this session has open (didOpen minus didClose), keyed by docKey
+// (rpc.mjs) so a push spelled differently from the didOpen still matches. A
+// server pushes diagnostics for whole projects, and the shared manager runs
+// servers for every session's worktree: pushes for documents this session
+// never opened are other sessions' churn, which the client renders into this
+// session's context all the same (measured 2026-10-11: 92% of a session's
+// diagnostic bytes were never-opened files in other agents' worktrees). A
+// publishDiagnostics passes when its document is open or its diagnostics
+// array is empty — a clear is always harmless and must reach the client;
+// LSPKIT_RAW=1 passes every push through, the same switch as shape.mjs.
 const openDocs = new Set();
 const raw = process.env.LSPKIT_RAW === '1';
 
@@ -45,8 +47,8 @@ readFrames(process.stdin, (msg) => {
 	if (msg.method === 'exit') exit();
 	if (msg.method === 'shutdown') shutdownReceived = true;
 	if (msg.method === 'initialize') init = msg.params;
-	if (msg.method === 'textDocument/didOpen') openDocs.add(msg.params?.textDocument?.uri);
-	if (msg.method === 'textDocument/didClose') openDocs.delete(msg.params?.textDocument?.uri);
+	if (msg.method === 'textDocument/didOpen') openDocs.add(docKey(msg.params?.textDocument?.uri));
+	if (msg.method === 'textDocument/didClose') openDocs.delete(docKey(msg.params?.textDocument?.uri));
 	const request = msg.method && msg.id != null;
 	link ??= open().catch((e) => {
 		link = null;
@@ -77,7 +79,7 @@ async function open() {
 	});
 	readFrames(socket, (msg) => {
 		if (msg.method === 'lsp-kit/log') return void process.stderr.write(msg.params.line + '\n');
-		if (!raw && msg.method === 'textDocument/publishDiagnostics' && !openDocs.has(msg.params?.uri)) return;
+		if (!raw && msg.method === 'textDocument/publishDiagnostics' && msg.params?.diagnostics?.length && !openDocs.has(docKey(msg.params?.uri))) return;
 		if (msg.id != null && !msg.method) {
 			// Shape the answer before the client renders it (shape.mjs); the method
 			// comes from the request this answers.

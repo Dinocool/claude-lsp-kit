@@ -1,9 +1,10 @@
-// What the per-session proxy and the machine-wide manager share: LSP framing
-// and the manager's endpoint.
+// What the per-session proxy and the machine-wide manager share: LSP framing,
+// the manager's endpoint and the document key.
 import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 export const frame = (msg) => {
 	const body = Buffer.from(JSON.stringify(msg), 'utf8');
@@ -65,3 +66,20 @@ export function endpoint() {
 }
 export const dataDir = () => process.env.CLAUDE_PLUGIN_DATA || tmpdir();
 export const pipePath = (name, dir) => (process.platform === 'win32' ? `\\\\.\\pipe\\${name}` : join(dir, `${name}.sock`));
+
+// A document's key for matching one uri against another however they're
+// spelled (a server may spell a uri differently in diagnostics than the
+// client's didOpen: drive-letter case, percent-encoding): file uris by their
+// path, case-folded where the file system is; anything else — including a
+// file url whose path this platform can't read (no drive letter on Windows) —
+// unchanged.
+export const docKey = (uri) => {
+	if (!uri?.startsWith('file:')) return uri;
+	let path;
+	try {
+		path = fileURLToPath(uri);
+	} catch {
+		return uri;
+	}
+	return process.platform === 'win32' || process.platform === 'darwin' ? path.toLowerCase() : path;
+};

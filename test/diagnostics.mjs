@@ -1,8 +1,10 @@
-// Diagnostics gating (proxy.mjs): a publishDiagnostics reaches the client only
-// for a document the session opened (didOpen minus didClose); LSPKIT_RAW=1
-// forwards every push. Drives real proxies against a fake manager on a private
-// pipe, so no language server is needed — the fake manager pushes the
-// notifications and the test watches what the proxy lets through.
+// Diagnostics gating (proxy.mjs): a publishDiagnostics reaches the client for
+// a document the session opened (didOpen minus didClose, matched by file path
+// however the uri is spelled) or when its diagnostics array is empty — a clear
+// always passes; LSPKIT_RAW=1 forwards every push. Drives real proxies against
+// a fake manager on a private pipe, so no language server is needed — the fake
+// manager pushes the notifications and the test watches what the proxy lets
+// through.
 // Usage: node test/diagnostics.mjs <scratchDir>
 import { createServer } from 'node:net';
 import { frame, pipePath, readFrames } from '../plugins/lsp-kit/rpc.mjs';
@@ -49,11 +51,26 @@ push({ jsonrpc: '2.0', method: 'textDocument/publishDiagnostics', params: { uri:
 await wait(400);
 check(JSON.stringify(got) === JSON.stringify(['file:///opened.ts']), `open document's diagnostics forwarded, unopened dropped (got ${JSON.stringify(got)})`);
 
+// After didClose the uri is no longer open, but the server's empty follow-up
+// push is the clear that removes the file's last errors: it must pass, while a
+// non-empty push for the closed document still doesn't.
 client.notify('textDocument/didClose', { textDocument: { uri: 'file:///opened.ts' } });
 await wait(150);
 push({ jsonrpc: '2.0', method: 'textDocument/publishDiagnostics', params: { uri: 'file:///opened.ts', diagnostics: [] } });
+push({ jsonrpc: '2.0', method: 'textDocument/publishDiagnostics', params: { uri: 'file:///opened.ts', diagnostics: [{ range: { start: { line: 0, character: 0 }, end: { line: 0, character: 5 } }, message: 'a late diagnostic' }] } });
 await wait(400);
-check(got.length === 1, `closed document's diagnostics dropped too (got ${got.length})`);
+check(JSON.stringify(got) === JSON.stringify(['file:///opened.ts', 'file:///opened.ts']), `after didClose the empty clear reaches the client and a non-empty push does not (got ${JSON.stringify(got)})`);
+
+// A push spelled differently from the didOpen (drive-letter case, %3A) is the
+// same document and passes. The fold is a Windows behaviour; elsewhere it
+// would be two different paths.
+if (process.platform === 'win32') {
+	client.open('file:///D:/cased.ts', 'typescript', 'const c = 3\n');
+	await wait(150);
+	push({ jsonrpc: '2.0', method: 'textDocument/publishDiagnostics', params: { uri: 'file:///d%3A/cased.ts', diagnostics: [{ range: { start: { line: 0, character: 0 }, end: { line: 0, character: 5 } }, message: 'same document, other spelling' }] } });
+	await wait(400);
+	check(got.at(-1) === 'file:///d%3A/cased.ts', `a push whose uri differs from the didOpen only in drive-letter case or %3A encoding reaches the client (got ${JSON.stringify(got)})`);
+} else log('skipped on this platform: matching a drive-letter case or %3A spelling is a Windows behaviour');
 client.notify('exit', null);
 
 const rawGot = [];
