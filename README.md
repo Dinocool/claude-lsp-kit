@@ -442,6 +442,9 @@ started with, and with it its manager.
 - `node test/shape.mjs <scratchDir>` checks response shaping: the
   documentSymbol outline rule and the location dedupe on synthetic
   payloads, then one real Lua answer raw beside shaped.
+- `node test/diagnostics.mjs <scratchDir>` checks diagnostics gating against
+  a fake manager: which pushes reach the session (open documents, clears,
+  config files) and which are dropped.
 - `node tools/measure-shaping.mjs <scratchDir>` is no test: it runs a fixed
   query set on generated Lua fixtures through the proxy, raw (LSPKIT_RAW=1)
   and shaped, and prints each answer's byte size before and after.
