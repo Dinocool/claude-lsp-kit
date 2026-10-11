@@ -136,10 +136,12 @@ check(await (async () => {
 })(), `the TypeScript server (pid ${pid}) exits with the manager`);
 
 // ---- the machine-wide cap, shared with the other languages ---------------------------
-// With a cap of 1, starting the TypeScript server stops the idle Lua server.
-const capped = { LSP_KIT_PIPE: privatePipe(), LSP_KIT_MAX_SERVERS: '1' };
+// With a cap of 1, starting the TypeScript server stops the Lua server once
+// it was last used over a check (a quarter of IDLE_MS) ago.
+const capped = { LSP_KIT_PIPE: privatePipe(), LSP_KIT_MAX_SERVERS: '1', LSP_KIT_IDLE_MS: '4000' };
 const lua = startProxy('lua', repo, { ...capped, name: 'lua' });
 await lua.initialize(repo);
+await wait(1500);
 const ts = startProxy('typescript', repo, { ...capped, name: 'ts' });
 await ts.initialize(repo);
 got = await ask(ts, 'textDocument/definition', 'src/use.ts', 1, 0);

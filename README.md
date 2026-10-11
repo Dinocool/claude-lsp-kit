@@ -88,12 +88,16 @@ junctions); each session only ever sees its own spelling.
   are gone.
 - A server starts on the first request for its checkout, and stops after
   5 minutes unused or when its directory is deleted.
+- No rule stops a server in use: one with a request in flight, or used
+  within the last check (a minute, or a quarter of `LSP_KIT_IDLE_MS` if
+  shorter). Otherwise a session's lookup could lose its server between two
+  steps, and restart it (rust-analyzer re-indexing) for the next.
 - At most 6 servers run machine-wide (`LSP_KIT_MAX_SERVERS`). Starting one
-  more stops the least recently used server without a request in flight. If
-  every server has one, the cap is exceeded and logged.
+  more stops the least recently used server not in use. If every server is
+  in use, the cap is exceeded and logged.
 - The servers may use 6 GB together (`LSP_KIT_MAX_MEMORY_MB`, in MB), and
-  idle ones stop while the machine has under 8 GB free
-  (`LSP_KIT_MIN_FREE_MB`). See [Memory](#memory).
+  servers stop while the machine's free memory is under a floor (an eighth
+  of its memory, `LSP_KIT_MIN_FREE_MB`). See [Memory](#memory).
 - A server that stops, crashes or is killed starts again on the next request
   for its checkout.
 - When a session ends, its documents are released; its servers stay for
@@ -115,10 +119,10 @@ Memory per server grows with the checkout. Measured: rust-analyzer about
 repo with a few files open (more for each project it loads). Eight sessions'
 own servers once took 24 GB and the machine ran out of commit.
 
-- Once a minute (or every `LSP_KIT_IDLE_MS`, if shorter) the manager measures
-  each server. While the servers together use more than the limit, the least
-  recently used server without a request in flight stops. If every server
-  left has one, the limit is exceeded and logged.
+- On each check the manager measures each server. While the servers
+  together use more than the limit, the least recently used server not in
+  use stops. If every server left is in use, the limit is exceeded and
+  logged.
 - A server's memory is its own plus its child processes': rust-analyzer's
   proc-macro servers and cargo check use memory on its behalf, and end with
   it.
@@ -126,17 +130,25 @@ own servers once took 24 GB and the machine ran out of commit.
     machine ran out of.
   - Elsewhere it is resident memory (`ps` rss).
 - A server that alone uses more than the limit follows the same rule. It
-  stops whenever it has no request in flight, after any idle server used less
+  stops whenever it is not in use, after any idle server used less
   recently. The log names it once per start, in capitals.
-- While the machine's free physical memory (`os.freemem()`) is under the
-  floor, the least recently used server without a request in flight stops,
-  one per measurement, counting that measurement's idle stops: a stopped
+- While the machine's free memory is under the floor, the least recently
+  used server not in use stops. It stops one per check, and none in a check
+  that already stopped one (unused, or its directory gone): a stopped
   server's memory is freed as it exits, so the next reading is the first to
   show it. The servers' own limit can't see the rest of the machine; a dozen
   agent worktrees' servers once left so little free that Claude Code's
   low-memory handling killed background agents. The floor never refuses a
   start.
-- The memory limit, the floor and the server cap stop servers by this same rule.
+  - The floor is an eighth of the machine's memory (8 GB of 64, 2 GB of 16).
+    `LSP_KIT_MIN_FREE_MB` sets it in MB, and `LSP_KIT_MIN_FREE_MB=0` turns
+    it off.
+  - Free memory is Node's `os.freemem()`. On Windows and Linux it counts
+    memory the system can hand out at once (Linux `MemAvailable`, cache
+    included). On macOS it counts only free pages, leaving out cached and
+    inactive ones, so it reads lower and the floor triggers sooner.
+- The memory limit, the floor and the server cap stop servers by this same
+  rule.
 - The log shows each server's memory when first measured, after each change
   of 10% or more, and at its stop, for example
   `Rust server #2 (pid 1234, 3 processes) uses 3.4 GB`.
@@ -434,7 +446,8 @@ started with, and with it its manager.
   - `LSP_KIT_TRACE=1` adds every message to the log.
   - `LSP_KIT_MAX_SERVERS` sets the machine-wide cap (6).
   - `LSP_KIT_MAX_MEMORY_MB` sets the machine-wide memory limit in MB (6144).
-  - `LSP_KIT_MIN_FREE_MB` sets the machine's free memory floor in MB (8192).
+  - `LSP_KIT_MIN_FREE_MB` sets the machine's free memory floor in MB (an
+    eighth of its memory; 0 turns it off).
   - `LSP_KIT_IDLE_MS` sets the idle stop (5 minutes; the tests shorten it).
   - `LSP_KIT_PIPE` names a private manager; the tests give each run its own.
 
@@ -469,8 +482,7 @@ started with, and with it its manager.
   worktree's server, and removes a worktree while its server runs. It checks
   no console window shows for the manager or its servers (Windows), that
   killing the manager stops every server, and the machine-wide cap across
-  two sessions (least recently used first, never one with a request in
-  flight). The session's server stops when idle (one server per checkout
+  two sessions (least recently used first, never one in use). The session's server stops when idle (one server per checkout
   however a request spells it), and a manager left alone exits, never
   before it has accepted the session that started it (its npm lookup made
   slower than the idle stop) and never while a connection that hasn't said
@@ -480,10 +492,12 @@ started with, and with it its manager.
   server with a request in flight never stops, and the limit is exceeded and
   logged. A real server's measured memory is above zero and below the
   machine's. Under a free memory floor above the machine's memory, one idle
-  server stops per measurement, least recently used first, never the stub;
-  with free memory above the floor, none stops. The tests' other managers get
-  a 1 MB floor, so the machine's own free memory never stops their servers. Then it kills the stub's manager: the stub's helper process
-  (and the stub, off Windows) outlives it. The next manager's start stops
+  server stops per check, least recently used first, never the stub nor a
+  server used within the last check, and none in a check that stopped a
+  server whose directory is gone. Above the floor, none stops. The tests'
+  other managers run with the floor off, so the machine's own free memory
+  never stops their servers. Then it kills the stub's manager: the stub's
+  helper process (and the stub, off Windows) outlives it. The next manager's start stops
   them and logs it. A look-alike lsp-kit didn't start, the same program also
   without a live parent, keeps running, even with a gone manager's record
   naming its pid. So do a live manager's server and its record. A record

@@ -2,7 +2,8 @@
 // a crashed worktree server and a crashed session-root server both come back on
 // the next request; a worktree can be removed while its server runs; killing
 // the manager takes every server with it; the machine-wide cap stops the least
-// recently used server across sessions, never one with a request in flight;
+// recently used server across sessions, never one in use (a request in flight
+// or used within the last check);
 // the session root's server stops when idle and restarts on demand, and a
 // manager left with no session, connection or server exits, never before it
 // has accepted the session that started it, however slow its npm lookup.
@@ -79,9 +80,10 @@ check(await until(() => aPids.every((p) => !alive(p)), 5000), `killing the manag
 
 // ---- the machine-wide cap -----------------------------------------------------
 // Two sessions on one manager with a cap of 3 use four checkouts: the fourth
-// start stops the least recently used server, another session's.
+// start stops the least recently used server, another session's, once the
+// three were last used over a check (a quarter of IDLE_MS) ago.
 const wts = [1, 2, 3].map((n) => (sh(`git worktree add -q .claude/worktrees/wt${n}`), join(repo, '.claude', 'worktrees', `wt${n}`)));
-const capped = { LSP_KIT_PIPE: privatePipe(), LSP_KIT_MAX_SERVERS: '3' };
+const capped = { LSP_KIT_PIPE: privatePipe(), LSP_KIT_MAX_SERVERS: '3', LSP_KIT_IDLE_MS: '12000' };
 const x = startProxy('lua', repo, { ...capped, name: 'x' });
 const y = startProxy('lua', repo, { ...capped, name: 'y' });
 await x.initialize(repo);
@@ -89,6 +91,7 @@ await y.initialize(repo);
 await refs(x, repo);
 await refs(x, wts[0]);
 await refs(y, wts[1]);
+await wait(3500);
 check((await refs(y, wts[2])) === '3 refs', 'a fourth checkout answers with three servers live');
 check(y.stderr.some((l) => l.includes(`stopping Lua server #1 for ${repo}`)), "the least recently used server, the other session's main checkout, stopped for it");
 const most = Math.max(...starts(y).map((l) => Number(/\((\d+) live/.exec(l)[1])));
@@ -105,7 +108,7 @@ await refs(one, repo);
 const [first, second] = await Promise.all([wts[0], wts[1]].map((dir) => one.req('textDocument/references', refsParams(dir))));
 check(!first?.error && !second?.error, `both requests answer (${JSON.stringify(first?.error ?? second?.error ?? 'ok')})`);
 check(!one.stderr.some((l) => l.includes(`stopping Lua server #2 for ${wts[0]}`)), 'the server with a request in flight is not stopped for the next start');
-check(one.stderr.some((l) => /every live server has a request in flight: 2 exceed the cap of 1/.test(l)), 'the cap is exceeded and logged');
+check(one.stderr.some((l) => /every live server is in use: 2 exceed the cap of 1/.test(l)), 'the cap is exceeded and logged');
 await one.close();
 
 // ---- idle stop of the session root's server, manager exit ---------------------

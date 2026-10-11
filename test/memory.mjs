@@ -3,8 +3,9 @@
 // Lua server stops first, then the next, while a server with a request in
 // flight (test/stub-server.mjs posing as svelte-language-server) never stops;
 // a real server's measured memory is plausible. While the machine's free
-// memory is under the floor, one idle server stops per reaper tick, least
-// recently used first, never the stub; above it, none. Then the stub's manager is
+// memory is under the floor, one idle server stops per reaper tick (none in a
+// tick that stopped another), least recently used first, never one used within
+// the last tick or the stub; above it, none. Then the stub's manager is
 // killed and the stub's helper process outlives it (the stub too, off
 // Windows): the next manager's start stops them. It leaves running a
 // look-alike (the same program, orphaned too) that lsp-kit didn't start, even
@@ -36,6 +37,8 @@ writeFileSync(stub, `import(${JSON.stringify(new URL('./stub-server.mjs', import
 sh('git init -q && git add -A && git -c user.email=t@t -c user.name=t commit -qm init');
 sh('git worktree add -q .claude/worktrees/wt');
 const wt = join(repo, '.claude', 'worktrees', 'wt');
+sh('git worktree add -q .claude/worktrees/wt2');
+const wt2 = join(repo, '.claude', 'worktrees', 'wt2');
 
 const until = async (cond, ms) => {
 	for (const end = Date.now() + ms; !cond() && Date.now() < end; ) await wait(200);
@@ -55,8 +58,8 @@ const RECORDS = `lsp-kit-servers-${userInfo().username}-`; // manager.mjs's reco
 const bytes = (n, unit) => Number(n) * 2 ** (unit === 'GB' ? 30 : 20);
 
 // ---- the memory limit -----------------------------------------------------------
-// The limit is applied on the reaper tick (every IDLE_MS, here 20 s); none of
-// the servers has been unused that long by the first tick.
+// The limit is applied on the reaper tick (a quarter of IDLE_MS, here 5 s), to
+// servers last used over a tick ago; none has been unused for IDLE_MS.
 const limited = { LSP_KIT_PIPE: privatePipe(), LSP_KIT_MAX_MEMORY_MB: '1', LSP_KIT_IDLE_MS: '20000', STUB_HELPER: '1' };
 const lua = startProxy('lua', repo, { ...limited, name: 'lua' });
 await lua.initialize(repo);
@@ -67,7 +70,7 @@ await svelte.initialize(repo);
 svelte.req('textDocument/hover', { textDocument: { uri: pathToFileURL(join(repo, 'a.svelte')).href }, position: { line: 0, character: 1 } }); // never answered
 
 const memoryStops = () => lua.stderr.map((l) => /stopping (\w+) server #(\d+) .*over the memory limit/.exec(l)).filter(Boolean).map((m) => `${m[1]} #${m[2]}`);
-const exceeded = () => lua.stderr.some((l) => /every server left has a request in flight: their .* exceed the memory limit of 1 MB/.test(l));
+const exceeded = () => lua.stderr.some((l) => /every server left is in use: their .* exceed the memory limit of 1 MB/.test(l));
 await until(() => memoryStops().length >= 2 && exceeded(), 45000);
 check(memoryStops().join(', ') === 'Lua #1, Lua #2', `over the limit, the least recently used idle server stops first, then the next (${memoryStops().join(', ')})`);
 check(exceeded(), 'with only the server with a request in flight left, the limit is exceeded and logged');
@@ -75,32 +78,46 @@ check(!lua.stderr.some((l) => /stopping Svelte server/.test(l)), 'the server wit
 const reading = lua.stderr.map((l) => /Lua server #1 \(pid \d+, \d+ process(?:es)?\) uses ([\d.]+) (MB|GB)$/.exec(l)).find(Boolean);
 const used = reading && bytes(reading[1], reading[2]);
 check(used > 0 && used < totalmem(), `a real server's measured memory is plausible: ${reading?.slice(1).join(' ')} of the machine's ${(totalmem() / 2 ** 30).toFixed(1)} GB`);
-check(lua.stderr.some((l) => /Lua server #1 ALONE uses .*, over the memory limit of 1 MB: it stops whenever it has no request in flight/.test(l)), 'a server alone over the limit is named loudly');
+check(lua.stderr.some((l) => /Lua server #1 ALONE uses .*, over the memory limit of 1 MB: it stops whenever it is not in use/.test(l)), 'a server alone over the limit is named loudly');
 
 // ---- the free memory floor --------------------------------------------------------
 // A floor of twice the machine's memory keeps free memory under it at every
-// reaper tick (every IDLE_MS, here 30 s); the tests' 1 MB floor (client.mjs)
-// keeps it above. No memory limit applies here: the default is far above these servers.
-const floored = { LSP_KIT_PIPE: privatePipe(), LSP_KIT_MIN_FREE_MB: String((2 * totalmem()) / 2 ** 20), LSP_KIT_IDLE_MS: '30000' };
+// tick (a quarter of IDLE_MS, here 10 s); a 1 MB floor keeps it above. The default memory limit is far above these servers.
+const TICK = 10000;
+const floored = { LSP_KIT_PIPE: privatePipe(), LSP_KIT_MIN_FREE_MB: String((2 * totalmem()) / 2 ** 20), LSP_KIT_IDLE_MS: String(4 * TICK) };
 const under = startProxy('lua', repo, { ...floored, name: 'under' });
-const above = startProxy('lua', repo, { LSP_KIT_IDLE_MS: '20000', name: 'above' });
+const above = startProxy('lua', repo, { LSP_KIT_MIN_FREE_MB: '1', LSP_KIT_IDLE_MS: '20000', name: 'above' });
 await Promise.all([under.initialize(repo), above.initialize(repo)]);
-check((await refs(under, repo)) === '3 refs', 'under the floor: Lua server #1 (the main checkout) answers');
-check((await refs(under, wt)) === '3 refs', 'under the floor: Lua server #2 (the worktree) answers, used after #1');
+check((await refs(under, repo)) === '3 refs', 'under the floor: the main checkout answers');
+check((await refs(under, wt)) === '3 refs', 'under the floor: the worktree answers, used after the main checkout');
 const pinned = startProxy('svelte', repo, { ...floored, name: 'pinned' });
 await pinned.initialize(repo);
 pinned.req('textDocument/hover', { textDocument: { uri: pathToFileURL(join(repo, 'a.svelte')).href }, position: { line: 0, character: 1 } }); // never answered
 check((await refs(above, repo)) === '3 refs', 'above the floor: its Lua server answers');
 
-const floorStops = () => under.stderr.map((l) => /stopping (\w+) server #(\d+) .*: the machine has .* free, under the floor of /.exec(l)).filter(Boolean).map((m) => `${m[1]} #${m[2]}`);
-await until(() => floorStops().length >= 1, 60000);
+const name = (root) => ({ [repo]: 'main', [wt]: 'worktree', [wt2]: 'second worktree' })[root] ?? root;
+const floorStops = () => under.stderr.map((l) => / server #\d+ for (.*) \(pid .*: the machine has .* free, under the floor of /.exec(l)?.[1]).filter(Boolean).map(name);
+const when = async (cond, ms) => ((await until(cond, ms)) ? Date.now() : NaN);
+await when(() => floorStops().length >= 1, 60000);
 await wait(2000); // well inside the tick
-check(floorStops().join(', ') === 'Lua #1', `under the floor, one server stops per tick: the least recently used idle one (${floorStops().join(', ')})`);
-// Used again, so the next tick's stop is the floor's, not the idle stop's.
-check((await refs(under, wt)) === '3 refs', 'Lua server #2 is used again between the ticks');
-await until(() => floorStops().length >= 2, 40000);
-check(floorStops().join(', ') === 'Lua #1, Lua #2', `the next tick stops the next one (${floorStops().join(', ')})`);
-await wait(32000); // one more tick, with only the server with a request in flight left
+check(floorStops().join(', ') === 'main', `under the floor, one server stops per tick: the least recently used idle one (${floorStops().join(', ')})`);
+
+// The worktree, used just now, survives the next tick; the tick after the interval stops it.
+check((await refs(under, wt)) === '3 refs', 'the worktree is used again between the ticks');
+const usedAt = Date.now();
+const second = await when(() => floorStops().length >= 2, 40000);
+check(floorStops()[1] === 'worktree' && second - usedAt >= TICK - 1000, `a server used within the last tick isn't stopped (${floorStops()[1]} stopped ${((second - usedAt) / 1000).toFixed(1)} s after its use)`);
+
+// A tick that stops a server whose directory is gone stops none for the floor:
+// the main checkout restarts and the second worktree starts, both used before
+// the next tick; the second worktree is removed after that tick, so the one
+// after stops it, and the main checkout only a tick later.
+check((await refs(under, repo)) === '3 refs' && (await refs(under, wt2)) === '3 refs', 'the main checkout and the second worktree answer');
+await wait(second + TICK + 2000 - Date.now());
+sh('git worktree remove --force .claude/worktrees/wt2');
+const gone = await when(() => under.stderr.some((l) => l.includes(`for ${wt2} (`) && l.includes('its directory is gone')), 2 * TICK);
+const third = await when(() => floorStops().length >= 3, 3 * TICK);
+check(floorStops()[2] === 'main' && third - gone >= TICK - 1000, `the floor stops nothing in a tick that stopped another server (the main checkout stopped ${((third - gone) / 1000).toFixed(1)} s after the gone directory's)`);
 check(!under.stderr.some((l) => /stopping Svelte server/.test(l)), 'under the floor, the server with a request in flight is never stopped');
 const measured = above.stderr.some((l) => /Lua server #1 \(pid \d+, .*\) uses /.test(l));
 check(measured && !above.stderr.some((l) => /under the floor/.test(l)), `above the floor, nothing stops for it (measured on a tick: ${measured})`);

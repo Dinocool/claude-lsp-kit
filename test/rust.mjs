@@ -82,7 +82,7 @@ check(mainCodes().includes('E0505'), `it is still published after an edit and th
 // the server (a request per write) until the pulls are flowing, which takes
 // rust-analyzer anywhere from a few seconds to over 15; then only the churn and
 // its pulls go on, and the server stops within the idle limit plus one check
-// (the manager checks every IDLE_MS).
+// (the manager checks every quarter IDLE_MS).
 const IDLE_MS = 5000;
 const idleEnv = { LSP_KIT_PIPE: privatePipe(), LSP_KIT_IDLE_MS: String(IDLE_MS), CLAUDE_PLUGIN_DATA: join(process.argv[2], 'idle-data'), LSP_KIT_TRACE: '1' };
 const idle = startProxy('rust', real, { ...idleEnv, name: 'idle' });

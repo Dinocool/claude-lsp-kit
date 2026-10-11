@@ -30,10 +30,10 @@
 // start would exceed MAX_SERVERS live servers, or the servers' memory exceeds
 // MAX_MEMORY, the least recently used ones stop first; while the machine's free
 // memory is under MIN_FREE, the least recently used one stops, one per reaper
-// tick. A server with a request in flight is never stopped (if every one has,
-// the cap or limit is exceeded and logged). A server that exits is dropped, and
-// the next request for its checkout starts a fresh one (LSP 3.17: `initialize`
-// goes once per process). The manager itself exits once it has neither
+// tick. A server in use (a request in flight, or used within the last reaper
+// tick) is never stopped; if every one is, the cap or limit is exceeded and
+// logged. A server that exits is dropped, and the next request for its
+// checkout starts a fresh one (LSP 3.17: `initialize` goes once per process). The manager itself exits once it has neither
 // sessions nor servers; a session's exit only releases its documents.
 //
 // Sessions, the LSP 3.17 client side of each server:
@@ -61,7 +61,7 @@ import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, watch, writeFileSync } from 'node:fs';
 import { connect, createServer } from 'node:net';
-import { freemem, userInfo } from 'node:os';
+import { freemem, totalmem, userInfo } from 'node:os';
 import { createInterface } from 'node:readline';
 import { basename, dirname, extname, isAbsolute, join, relative, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -80,11 +80,18 @@ const MAX_MEMORY = (Number(process.env.LSP_KIT_MAX_MEMORY_MB) || 6 * 1024) * 2 *
 // The servers' own limit can't see the rest of the machine: a dozen agent
 // worktrees' servers beside the agents themselves drove free memory low enough
 // for Claude Code's low-memory reaper to kill background agents. Starting a
-// server is never refused for it; only idle ones stop.
-const MIN_FREE = (Number(process.env.LSP_KIT_MIN_FREE_MB) || 8 * 1024) * 2 ** 20;
+// server is never refused for it; only idle ones stop. A fixed floor would be
+// crossed all the time on a small machine, and on macOS, whose free memory
+// leaves out cached and inactive pages: the default is an eighth of the
+// machine's memory (8 GB of 64). LSP_KIT_MIN_FREE_MB=0 turns it off.
+const MIN_FREE = process.env.LSP_KIT_MIN_FREE_MB ? Number(process.env.LSP_KIT_MIN_FREE_MB) * 2 ** 20 : totalmem() / 8;
 const MEMORY_LOG_CHANGE = 0.1; // a server's memory is logged again once it moves this much
 const size = (bytes) => (bytes < 2 ** 30 ? `${Math.round(bytes / 2 ** 20)} MB` : `${(bytes / 2 ** 30).toFixed(1)} GB`);
 const IDLE_MS = Number(process.env.LSP_KIT_IDLE_MS) || 5 * 60 * 1000;
+// The reaper's interval. A quarter of IDLE_MS (when shorter than a minute)
+// leaves a server room to be past one tick unused, so stoppable, before it
+// stops for being idle.
+const TICK_MS = Math.min(IDLE_MS / 4, 60 * 1000);
 const STOP_KILL_MS = 5000; // a stopping server that hasn't exited by then is killed
 const STDERR_LINE = 300; // a server's stderr line is logged up to this many characters
 const WATCHED_FILES = 'workspace/didChangeWatchedFiles';
@@ -146,10 +153,10 @@ listener.listen(PIPE, () => {
 	try {
 		renameSync(LOG, LOG.replace(/\.log$/, '.previous.log'));
 	} catch {} // no earlier log
-	log(`manager pid ${process.pid} on ${PIPE} (cap ${MAX_SERVERS} servers, memory limit ${size(MAX_MEMORY)}, free memory floor ${size(MIN_FREE)}, idle stop ${IDLE_MS / 1000} s)`);
+	log(`manager pid ${process.pid} on ${PIPE} (cap ${MAX_SERVERS} servers, memory limit ${size(MAX_MEMORY)}, free memory floor ${MIN_FREE ? size(MIN_FREE) : 'off'}, idle stop ${IDLE_MS / 1000} s)`);
 	askNpm().then((npm) => log(npm.dir ? `npm's global folder: ${npm.dir}` : npm.error));
 	sweep().catch((e) => log(`leftover servers not swept: ${e.message}`));
-	setInterval(reap, Math.min(IDLE_MS, 60 * 1000));
+	setInterval(reap, TICK_MS);
 });
 
 // ---- leftover servers -----------------------------------------------------------
@@ -419,28 +426,33 @@ function stopServer(server, why) {
 }
 
 const busy = (server) => server.requests.size > 0 || server.waiting.size > 0;
+// No rule stops a server in use. Used within the last tick counts: under
+// pressure from outside the servers, the floor would otherwise stop a server
+// between two steps of a session's lookup, restart it for the next and stop it
+// again (rust-analyzer re-indexing each time).
+const inUse = (server) => busy(server) || Date.now() - server.lastUsed < TICK_MS;
 
 // One stopping rule for the cap, the memory limit and the free memory floor:
-// while `isOver()`, the least recently used server without a request in flight
-// stops. False when every server left has one (the cap or limit is then
-// exceeded and logged).
+// while `isOver()`, the least recently used server not in use stops. False
+// when every server left is in use (the cap or limit is then exceeded and
+// logged).
 function stopLeastRecent(isOver, why) {
-	const idle = [...servers.values()].filter((s) => !busy(s)).sort((a, b) => a.lastUsed - b.lastUsed);
+	const idle = [...servers.values()].filter((s) => !inUse(s)).sort((a, b) => a.lastUsed - b.lastUsed);
 	while (isOver() && idle.length) stopServer(idle.shift(), why);
 	return !isOver();
 }
 
 function makeRoom() {
 	if (!stopLeastRecent(() => servers.size >= MAX_SERVERS, `room for another under the cap of ${MAX_SERVERS} servers`))
-		log(`every live server has a request in flight: ${servers.size + 1} exceed the cap of ${MAX_SERVERS}`);
+		log(`every live server is in use: ${servers.size + 1} exceed the cap of ${MAX_SERVERS}`);
 }
 
 // On the reaper tick: every server's process tree recorded (see sweep) and its
 // memory measured, logged when it moved MEMORY_LOG_CHANGE; then stopLeastRecent
 // while the total exceeds MAX_MEMORY. A server that alone exceeds the limit is
 // no exception: it can't fit beside any other, and a leak that size is what the
-// limit is for. It stops whenever it has no request in flight, after any idle
-// server used less recently, and the log says so once, loudly.
+// limit is for. It stops whenever it is not in use, after any idle server
+// used less recently, and the log says so once, loudly.
 function measure() {
 	if (!servers.size) return;
 	record().then(
@@ -453,12 +465,12 @@ function measure() {
 				}
 				if (s.memory > MAX_MEMORY && !s.overAlone) {
 					s.overAlone = true;
-					log(`${s.lang.name} server #${s.no} ALONE uses ${size(s.memory)}, over the memory limit of ${size(MAX_MEMORY)}: it stops whenever it has no request in flight (LSP_KIT_MAX_MEMORY_MB sets the limit)`);
+					log(`${s.lang.name} server #${s.no} ALONE uses ${size(s.memory)}, over the memory limit of ${size(MAX_MEMORY)}: it stops whenever it is not in use (LSP_KIT_MAX_MEMORY_MB sets the limit)`);
 				}
 			}
 			const total = () => [...servers.values()].reduce((n, s) => n + (s.memory ?? 0), 0);
 			if (!stopLeastRecent(() => total() > MAX_MEMORY, `over the memory limit of ${size(MAX_MEMORY)}`))
-				log(`every server left has a request in flight: their ${size(total())} exceed the memory limit of ${size(MAX_MEMORY)}`);
+				log(`every server left is in use: their ${size(total())} exceed the memory limit of ${size(MAX_MEMORY)}`);
 		},
 		(e) => log(`memory not measured, so its limit wasn't applied and its servers not recorded this time: ${e.message}`)
 	);
@@ -487,7 +499,7 @@ function reap() {
 	const live = servers.size;
 	for (const s of servers.values()) {
 		if (!existsSync(s.root)) stopServer(s, 'its directory is gone');
-		else if (!busy(s) && Date.now() - s.lastUsed > IDLE_MS) stopServer(s, `unused for ${IDLE_MS / 1000} s`);
+		else if (!inUse(s) && Date.now() - s.lastUsed > IDLE_MS) stopServer(s, `unused for ${IDLE_MS / 1000} s`);
 	}
 	const free = freemem();
 	stopLeastRecent(() => servers.size === live && free < MIN_FREE, `the machine has ${size(free)} free, under the floor of ${size(MIN_FREE)}`);
