@@ -2,7 +2,9 @@
 // throwaway repo under <dir>. Under a 1 MB limit the least recently used idle
 // Lua server stops first, then the next, while a server with a request in
 // flight (test/stub-server.mjs posing as svelte-language-server) never stops;
-// a real server's measured memory is plausible. Then the stub's manager is
+// a real server's measured memory is plausible. While the machine's free
+// memory is under the floor, one idle server stops per reaper tick, least
+// recently used first, never the stub; above it, none. Then the stub's manager is
 // killed and the stub's helper process outlives it (the stub too, off
 // Windows): the next manager's start stops them. It leaves running a
 // look-alike (the same program, orphaned too) that lsp-kit didn't start, even
@@ -74,6 +76,40 @@ const reading = lua.stderr.map((l) => /Lua server #1 \(pid \d+, \d+ process(?:es
 const used = reading && bytes(reading[1], reading[2]);
 check(used > 0 && used < totalmem(), `a real server's measured memory is plausible: ${reading?.slice(1).join(' ')} of the machine's ${(totalmem() / 2 ** 30).toFixed(1)} GB`);
 check(lua.stderr.some((l) => /Lua server #1 ALONE uses .*, over the memory limit of 1 MB: it stops whenever it has no request in flight/.test(l)), 'a server alone over the limit is named loudly');
+
+// ---- the free memory floor --------------------------------------------------------
+// A floor of twice the machine's memory keeps free memory under it at every
+// reaper tick (every IDLE_MS, here 30 s); the tests' 1 MB floor (client.mjs)
+// keeps it above. No memory limit applies here: the default is far above these servers.
+const floored = { LSP_KIT_PIPE: privatePipe(), LSP_KIT_MIN_FREE_MB: String((2 * totalmem()) / 2 ** 20), LSP_KIT_IDLE_MS: '30000' };
+const under = startProxy('lua', repo, { ...floored, name: 'under' });
+const above = startProxy('lua', repo, { LSP_KIT_IDLE_MS: '20000', name: 'above' });
+await Promise.all([under.initialize(repo), above.initialize(repo)]);
+check((await refs(under, repo)) === '3 refs', 'under the floor: Lua server #1 (the main checkout) answers');
+check((await refs(under, wt)) === '3 refs', 'under the floor: Lua server #2 (the worktree) answers, used after #1');
+const pinned = startProxy('svelte', repo, { ...floored, name: 'pinned' });
+await pinned.initialize(repo);
+pinned.req('textDocument/hover', { textDocument: { uri: pathToFileURL(join(repo, 'a.svelte')).href }, position: { line: 0, character: 1 } }); // never answered
+check((await refs(above, repo)) === '3 refs', 'above the floor: its Lua server answers');
+
+const floorStops = () => under.stderr.map((l) => /stopping (\w+) server #(\d+) .*: the machine has .* free, under the floor of /.exec(l)).filter(Boolean).map((m) => `${m[1]} #${m[2]}`);
+await until(() => floorStops().length >= 1, 60000);
+await wait(2000); // well inside the tick
+check(floorStops().join(', ') === 'Lua #1', `under the floor, one server stops per tick: the least recently used idle one (${floorStops().join(', ')})`);
+// Used again, so the next tick's stop is the floor's, not the idle stop's.
+check((await refs(under, wt)) === '3 refs', 'Lua server #2 is used again between the ticks');
+await until(() => floorStops().length >= 2, 40000);
+check(floorStops().join(', ') === 'Lua #1, Lua #2', `the next tick stops the next one (${floorStops().join(', ')})`);
+await wait(32000); // one more tick, with only the server with a request in flight left
+check(!under.stderr.some((l) => /stopping Svelte server/.test(l)), 'under the floor, the server with a request in flight is never stopped');
+const measured = above.stderr.some((l) => /Lua server #1 \(pid \d+, .*\) uses /.test(l));
+check(measured && !above.stderr.some((l) => /under the floor/.test(l)), `above the floor, nothing stops for it (measured on a tick: ${measured})`);
+const pinnedPid = pinned.pidFor(repo);
+killManager(pinned.manager);
+killManager(above.manager);
+try {
+	process.kill(pinnedPid); // the stub outlives its manager off Windows
+} catch {} // gone with it
 
 // ---- leftover servers -------------------------------------------------------------
 // The stub and its helper were recorded. Killing their manager kills the stub

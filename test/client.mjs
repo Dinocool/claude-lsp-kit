@@ -85,7 +85,9 @@ export const processPath = (pid) =>
 export function startProxy(language, cwd, { name, ...env } = {}) {
 	const proxy = spawn(process.execPath, [fileURLToPath(new URL('../plugins/lsp-kit/proxy.mjs', import.meta.url)), language], {
 		cwd,
-		env: { ...process.env, LSP_KIT_PIPE: privatePipe(), ...env }
+		// The machine's own free memory must not stop a test's servers: a 1 MB floor
+		// unless a test sets one.
+		env: { ...process.env, LSP_KIT_PIPE: privatePipe(), LSP_KIT_MIN_FREE_MB: '1', ...env }
 	});
 	const waits = new Map();
 	const client = { proxy, stderr: [], onNotification: () => {}, name: name ?? `proxy ${proxy.pid}` };

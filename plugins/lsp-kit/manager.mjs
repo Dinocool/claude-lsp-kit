@@ -28,9 +28,10 @@
 // Lifecycle, one rule for every server: it starts on the first request for its
 // checkout; it stops after IDLE_MS unused or once its directory is gone; when a
 // start would exceed MAX_SERVERS live servers, or the servers' memory exceeds
-// MAX_MEMORY, the least recently used ones stop first. A server with a request
-// in flight is never stopped (if every one has, the cap or limit is exceeded and
-// logged). A server that exits is dropped, and
+// MAX_MEMORY, the least recently used ones stop first; while the machine's free
+// memory is under MIN_FREE, the least recently used one stops, one per reaper
+// tick. A server with a request in flight is never stopped (if every one has,
+// the cap or limit is exceeded and logged). A server that exits is dropped, and
 // the next request for its checkout starts a fresh one (LSP 3.17: `initialize`
 // goes once per process). The manager itself exits once it has neither
 // sessions nor servers; a session's exit only releases its documents.
@@ -60,7 +61,7 @@ import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, watch, writeFileSync } from 'node:fs';
 import { connect, createServer } from 'node:net';
-import { userInfo } from 'node:os';
+import { freemem, userInfo } from 'node:os';
 import { createInterface } from 'node:readline';
 import { basename, dirname, extname, isAbsolute, join, relative, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -71,14 +72,19 @@ import { docKey, endpoint, frame, readFrames } from './rpc.mjs';
 // Machine-wide, across sessions and languages. The cap stops a server only when
 // MAX_SERVERS checkouts used more recently (the one starting included) need
 // one, so no active work loses its navigation (lead's ruling).
-const MAX_SERVERS = Number(process.env.LSP_KIT_MAX_SERVERS) || 10;
+const MAX_SERVERS = Number(process.env.LSP_KIT_MAX_SERVERS) || 6;
 // Eight sessions' own servers once took ~24 GB and the machine hit its commit
 // limit. A server's memory is its process tree's (processes.mjs): rust-analyzer's
 // proc-macro servers and cargo check commit memory on its behalf, and end with it.
-const MAX_MEMORY = (Number(process.env.LSP_KIT_MAX_MEMORY_MB) || 12 * 1024) * 2 ** 20;
+const MAX_MEMORY = (Number(process.env.LSP_KIT_MAX_MEMORY_MB) || 6 * 1024) * 2 ** 20;
+// The servers' own limit can't see the rest of the machine: a dozen agent
+// worktrees' servers beside the agents themselves drove free memory low enough
+// for Claude Code's low-memory reaper to kill background agents. Starting a
+// server is never refused for it; only idle ones stop.
+const MIN_FREE = (Number(process.env.LSP_KIT_MIN_FREE_MB) || 8 * 1024) * 2 ** 20;
 const MEMORY_LOG_CHANGE = 0.1; // a server's memory is logged again once it moves this much
 const size = (bytes) => (bytes < 2 ** 30 ? `${Math.round(bytes / 2 ** 20)} MB` : `${(bytes / 2 ** 30).toFixed(1)} GB`);
-const IDLE_MS = Number(process.env.LSP_KIT_IDLE_MS) || 10 * 60 * 1000;
+const IDLE_MS = Number(process.env.LSP_KIT_IDLE_MS) || 5 * 60 * 1000;
 const STOP_KILL_MS = 5000; // a stopping server that hasn't exited by then is killed
 const STDERR_LINE = 300; // a server's stderr line is logged up to this many characters
 const WATCHED_FILES = 'workspace/didChangeWatchedFiles';
@@ -140,7 +146,7 @@ listener.listen(PIPE, () => {
 	try {
 		renameSync(LOG, LOG.replace(/\.log$/, '.previous.log'));
 	} catch {} // no earlier log
-	log(`manager pid ${process.pid} on ${PIPE} (cap ${MAX_SERVERS} servers, memory limit ${size(MAX_MEMORY)}, idle stop ${IDLE_MS / 1000} s)`);
+	log(`manager pid ${process.pid} on ${PIPE} (cap ${MAX_SERVERS} servers, memory limit ${size(MAX_MEMORY)}, free memory floor ${size(MIN_FREE)}, idle stop ${IDLE_MS / 1000} s)`);
 	askNpm().then((npm) => log(npm.dir ? `npm's global folder: ${npm.dir}` : npm.error));
 	sweep().catch((e) => log(`leftover servers not swept: ${e.message}`));
 	setInterval(reap, Math.min(IDLE_MS, 60 * 1000));
@@ -414,9 +420,10 @@ function stopServer(server, why) {
 
 const busy = (server) => server.requests.size > 0 || server.waiting.size > 0;
 
-// One stopping rule for the cap and the memory limit: while `isOver()`, the
-// least recently used server without a request in flight stops. False when
-// every server left has one (the cap or limit is then exceeded and logged).
+// One stopping rule for the cap, the memory limit and the free memory floor:
+// while `isOver()`, the least recently used server without a request in flight
+// stops. False when every server left has one (the cap or limit is then
+// exceeded and logged).
 function stopLeastRecent(isOver, why) {
 	const idle = [...servers.values()].filter((s) => !busy(s)).sort((a, b) => a.lastUsed - b.lastUsed);
 	while (isOver() && idle.length) stopServer(idle.shift(), why);
@@ -471,11 +478,19 @@ function measure() {
 // on Windows kept a new manager from listening: the next sessions found none.
 // getConnections counts accepted sockets until they close
 // (https://nodejs.org/api/net.html#servergetconnectionscallback).
+//
+// The free memory floor stops at most one server per tick, counting this tick's
+// other stops: a stopped server's memory is freed only as its processes exit,
+// so the next tick's reading is the first to show it, and stopping until this
+// one's reading cleared the floor would stop every idle server at once.
 function reap() {
+	const live = servers.size;
 	for (const s of servers.values()) {
 		if (!existsSync(s.root)) stopServer(s, 'its directory is gone');
 		else if (!busy(s) && Date.now() - s.lastUsed > IDLE_MS) stopServer(s, `unused for ${IDLE_MS / 1000} s`);
 	}
+	const free = freemem();
+	stopLeastRecent(() => servers.size === live && free < MIN_FREE, `the machine has ${size(free)} free, under the floor of ${size(MIN_FREE)}`);
 	measure();
 	// Unlisten first: a proxy that connects from now on starts a new manager.
 	listener.getConnections((e, connections) => connections === 0 && !running.size && listener.close(() => process.exit(0)));

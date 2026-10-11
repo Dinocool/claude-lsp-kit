@@ -58,7 +58,7 @@ const refs = async (client, dir) => {
 };
 
 for (let round = 1; round <= ROUNDS; round++) {
-	const client = startProxy('lua', repo, { name: `round ${round}` });
+	const client = startProxy('lua', repo, { name: `round ${round}`, LSP_KIT_MAX_SERVERS: String(TOGETHER + 1) });
 	await client.initialize(repo);
 	const answers = await Promise.all(worktrees.map((dir) => refs(client, dir)));
 	const failed = answers.filter((a) => a !== '3 refs');

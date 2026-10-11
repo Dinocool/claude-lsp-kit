@@ -87,12 +87,13 @@ junctions); each session only ever sees its own spelling.
   start a new manager and the old one ends when its last session and server
   are gone.
 - A server starts on the first request for its checkout, and stops after
-  10 minutes unused or when its directory is deleted.
-- At most 10 servers run machine-wide (`LSP_KIT_MAX_SERVERS`). Starting one
+  5 minutes unused or when its directory is deleted.
+- At most 6 servers run machine-wide (`LSP_KIT_MAX_SERVERS`). Starting one
   more stops the least recently used server without a request in flight. If
   every server has one, the cap is exceeded and logged.
-- The servers may use 12 GB together (`LSP_KIT_MAX_MEMORY_MB`, in MB). See
-  [Memory](#memory).
+- The servers may use 6 GB together (`LSP_KIT_MAX_MEMORY_MB`, in MB), and
+  idle ones stop while the machine has under 8 GB free
+  (`LSP_KIT_MIN_FREE_MB`). See [Memory](#memory).
 - A server that stops, crashes or is killed starts again on the next request
   for its checkout.
 - When a session ends, its documents are released; its servers stay for
@@ -127,7 +128,15 @@ own servers once took 24 GB and the machine ran out of commit.
 - A server that alone uses more than the limit follows the same rule. It
   stops whenever it has no request in flight, after any idle server used less
   recently. The log names it once per start, in capitals.
-- The memory limit and the server cap stop servers by this same rule.
+- While the machine's free physical memory (`os.freemem()`) is under the
+  floor, the least recently used server without a request in flight stops,
+  one per measurement, counting that measurement's idle stops: a stopped
+  server's memory is freed as it exits, so the next reading is the first to
+  show it. The servers' own limit can't see the rest of the machine; a dozen
+  agent worktrees' servers once left so little free that Claude Code's
+  low-memory handling killed background agents. The floor never refuses a
+  start.
+- The memory limit, the floor and the server cap stop servers by this same rule.
 - The log shows each server's memory when first measured, after each change
   of 10% or more, and at its stop, for example
   `Rust server #2 (pid 1234, 3 processes) uses 3.4 GB`.
@@ -419,13 +428,14 @@ started with, and with it its manager.
   <root> (<n> live, pid <pid>)`, and each session's start as `session #n
   (<Lang>, pid <proxy pid>) joined manager pid <pid>`. Each stop names its
   pid, its last measured memory and why it stopped (unused, its directory is
-  gone, the cap, the memory limit).
+  gone, the cap, the memory limit, the free memory floor).
 - These variables in Claude Code's environment (for example `env` in
   `settings.json`) reach the manager when a session starts it:
   - `LSP_KIT_TRACE=1` adds every message to the log.
-  - `LSP_KIT_MAX_SERVERS` sets the machine-wide cap (10).
-  - `LSP_KIT_MAX_MEMORY_MB` sets the machine-wide memory limit in MB (12288).
-  - `LSP_KIT_IDLE_MS` sets the idle stop (10 minutes; the tests shorten it).
+  - `LSP_KIT_MAX_SERVERS` sets the machine-wide cap (6).
+  - `LSP_KIT_MAX_MEMORY_MB` sets the machine-wide memory limit in MB (6144).
+  - `LSP_KIT_MIN_FREE_MB` sets the machine's free memory floor in MB (8192).
+  - `LSP_KIT_IDLE_MS` sets the idle stop (5 minutes; the tests shorten it).
   - `LSP_KIT_PIPE` names a private manager; the tests give each run its own.
 
   A running manager keeps the values it started with: end it (its pid is in
@@ -469,7 +479,10 @@ started with, and with it its manager.
   least recently used idle Lua server stops first, then the next. A stub
   server with a request in flight never stops, and the limit is exceeded and
   logged. A real server's measured memory is above zero and below the
-  machine's. Then it kills the stub's manager: the stub's helper process
+  machine's. Under a free memory floor above the machine's memory, one idle
+  server stops per measurement, least recently used first, never the stub;
+  with free memory above the floor, none stops. The tests' other managers get
+  a 1 MB floor, so the machine's own free memory never stops their servers. Then it kills the stub's manager: the stub's helper process
   (and the stub, off Windows) outlives it. The next manager's start stops
   them and logs it. A look-alike lsp-kit didn't start, the same program also
   without a live parent, keeps running, even with a gone manager's record
