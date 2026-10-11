@@ -282,13 +282,16 @@ declaration and typeDefinition answers are deduped, keeping the server's
 order, and never capped (the client prints its own count header); `hover`
 passes through. `LSPKIT_RAW=1` turns shaping off for that session.
 
-Diagnostics are gated the same way: a `publishDiagnostics` reaches the client
-for a document the session has opened (`didOpen` minus `didClose`, matched by
-file path however the uri is spelled), and an empty push — a clear — always
-passes. The shared manager runs servers for every session's worktree, and
-whole-project pushes for files a session never looked at are other sessions'
-churn rendering into its context — measured at 92% of one session's diagnostic
-bytes. The same `LSPKIT_RAW=1` switch forwards every push.
+Diagnostics are gated the same way: a non-empty `publishDiagnostics` for a
+file of a served language reaches the client only while the session has it
+open (`didOpen` minus `didClose`, matched by file path however the uri is
+spelled); a push for any other file — project config such as `tsconfig.json`
+or `Cargo.toml`, whose errors say why answers come back empty — or an empty
+push, a clear, always passes. The shared manager runs servers for every
+session's worktree, and whole-project pushes for code files a session never
+looked at are other sessions' churn rendering into its context — measured at
+92% of one session's diagnostic bytes. The same `LSPKIT_RAW=1` switch
+forwards every push.
 
 ## Settings
 

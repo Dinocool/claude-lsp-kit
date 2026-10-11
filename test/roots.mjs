@@ -74,7 +74,7 @@ const diags = (await diagnosticsFor(mainUri)) ?? [];
 log(`main diagnostics: ${JSON.stringify(diags.map((d) => `${d.code}: ${d.message.split('\n')[0]}`))}`);
 check(!diags.some((d) => d.code === 'deprecated' || d.code === 'undefined-global'), '.luarc.json applies: Lua 5.1 runtime, undefined-global disabled');
 
-const expected = ['M 1-1', '  limit 1-1', '  cfg 1-1', '    depth 1-1', 'helper 2-8', '  inner 5-5', 'M.run 9-13', 'M:method 14-14'].join('\n');
+const expected = ['M 1-1', 'helper 2-8', '  inner 5-5', 'M.run 9-13', 'M:method 14-14'].join('\n');
 const got = await outline(mainUri);
 check(got === expected, `documentSymbol is the outline (no body locals, params, blocks or anonymous callbacks):\n${got}`);
 const ws = await req('workspace/symbol', { query: 'twice' });

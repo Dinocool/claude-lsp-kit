@@ -6,7 +6,7 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { NAVIGATIONAL, shape } from '../plugins/lsp-kit/shape.mjs';
+import { shape, stays } from '../plugins/lsp-kit/shape.mjs';
 import { check, finish, killManager, log, privatePipe, scratch, startProxy, wait } from './client.mjs';
 
 // ---- unit: the documentSymbol outline ------------------------------------------
@@ -95,8 +95,8 @@ const shapedNames = names(shapedAnswer);
 check(['M', 'M.plain', 'M.cfg', 'nested', 'deep', 'M.fn', 'top'].every((n) => rawNames.includes(n)), `the raw answer keeps file-level fields and nested tables (${rawNames.join(', ')})`);
 check(['M', 'M.plain', 'M.cfg', 'M.fn', 'top'].every((n) => shapedNames.includes(n)), `the shaped answer keeps the file-level outline (${shapedNames.join(', ')})`);
 check(!shapedNames.includes('nested') && !shapedNames.includes('deep'), 'the shaped answer drops table fields deeper than file level');
-const depth = (list, d = 1) => Array.isArray(list ?? []) && (list ?? []).every((s) => d === 1 || NAVIGATIONAL.has(s.kind) || s.children?.length) && (list ?? []).every((s) => depth(s.children, d + 1));
-check(depth(shapedAnswer), 'the shaped answer keeps no childless non-navigational symbol below file level');
+const depth = (list, d = 1, parent = 0) => Array.isArray(list ?? []) && (list ?? []).every((s) => stays(s.kind, d, parent) || s.children?.length) && (list ?? []).every((s) => depth(s.children, d + 1, s.kind));
+check(depth(shapedAnswer), 'the shaped answer keeps only what the outline rule keeps below file level');
 log(`documentSymbol payload: raw ${JSON.stringify(rawAnswer).length} bytes, shaped ${JSON.stringify(shapedAnswer).length} bytes`);
 await raw.close();
 await shaped.close();

@@ -33,6 +33,10 @@ export const NAVIGATIONAL = new Set([2, 3, 4, 5, 6, 9, 10, 11, 12, 23]);
 // Kinds that declare a type, whose members are its API: Class, Enum,
 // Interface, Struct.
 const TYPES = new Set([5, 10, 11, 23]);
+// The outline's keep rule for one symbol, its kept children apart: file
+// level, a navigational kind, or a type-declaring parent. Exported so the
+// tests check this rule, not a copy of it.
+export const stays = (kind, depth, parent) => depth === 1 || NAVIGATIONAL.has(kind) || TYPES.has(parent);
 const OUTLINE = 'textDocument/documentSymbol';
 const LOCATIONS = new Set(['textDocument/references', 'textDocument/definition', 'textDocument/implementation', 'textDocument/declaration', 'textDocument/typeDefinition']);
 
@@ -51,7 +55,7 @@ function outline(symbols) {
 		const kept = [];
 		for (const s of list) {
 			const children = s.children ? walk(s.children, depth + 1, s.kind) : s.children;
-			if (depth === 1 || NAVIGATIONAL.has(s.kind) || TYPES.has(parent) || children?.length) {
+			if (stays(s.kind, depth, parent) || children?.length) {
 				if (children === s.children) kept.push(s);
 				else {
 					changed = true;

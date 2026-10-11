@@ -13,6 +13,7 @@
 import { spawn } from 'node:child_process';
 import { connect } from 'node:net';
 import { homedir } from 'node:os';
+import { extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { LANGUAGES } from './languages.mjs';
 import { docKey, endpoint, frame, readFrames } from './rpc.mjs';
@@ -33,11 +34,21 @@ const unanswered = new Map(); // client request id -> method, sent to the curren
 // never opened are other sessions' churn, which the client renders into this
 // session's context all the same (measured 2026-10-11: 92% of a session's
 // diagnostic bytes were never-opened files in other agents' worktrees). A
-// publishDiagnostics passes when its document is open or its diagnostics
-// array is empty — a clear is always harmless and must reach the client;
+// non-empty publishDiagnostics for a file of a language the kit serves passes
+// only while the session has it open; a push for any other file (project
+// config such as tsconfig.json or Cargo.toml, whose errors explain empty
+// answers) or an empty one (a clear, always harmless) always passes;
 // LSPKIT_RAW=1 passes every push through, the same switch as shape.mjs.
 const openDocs = new Set();
 const raw = process.env.LSPKIT_RAW === '1';
+// The extensions of the languages the kit serves, from the one copy of the
+// maps (languages.mjs reads plugin.json).
+const served = new Set(Object.values(LANGUAGES).flatMap((l) => Object.keys(l.extensionToLanguage)));
+const gated = (params) => {
+	if (!params?.diagnostics?.length || typeof params?.uri !== 'string') return false;
+	const key = docKey(params.uri);
+	return served.has(extname(key).toLowerCase()) && !openDocs.has(key);
+};
 
 const toClient = (msg) => process.stdout.write(frame(msg));
 const fail = (id, message) => toClient({ jsonrpc: '2.0', id, error: { code: -32603, message: `lsp-kit: ${message}` } });
@@ -79,7 +90,7 @@ async function open() {
 	});
 	readFrames(socket, (msg) => {
 		if (msg.method === 'lsp-kit/log') return void process.stderr.write(msg.params.line + '\n');
-		if (!raw && msg.method === 'textDocument/publishDiagnostics' && msg.params?.diagnostics?.length && !openDocs.has(docKey(msg.params?.uri))) return;
+		if (!raw && msg.method === 'textDocument/publishDiagnostics' && gated(msg.params)) return;
 		if (msg.id != null && !msg.method) {
 			// Shape the answer before the client renders it (shape.mjs); the method
 			// comes from the request this answers.

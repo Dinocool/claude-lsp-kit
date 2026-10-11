@@ -70,16 +70,9 @@ export const pipePath = (name, dir) => (process.platform === 'win32' ? `\\\\.\\p
 // A document's key for matching one uri against another however they're
 // spelled (a server may spell a uri differently in diagnostics than the
 // client's didOpen: drive-letter case, percent-encoding): file uris by their
-// path, case-folded where the file system is; anything else — including a
-// file url whose path this platform can't read (no drive letter on Windows) —
-// unchanged.
+// path, case-folded where the file system is; anything else unchanged.
 export const docKey = (uri) => {
 	if (!uri?.startsWith('file:')) return uri;
-	let path;
-	try {
-		path = fileURLToPath(uri);
-	} catch {
-		return uri;
-	}
+	const path = fileURLToPath(uri);
 	return process.platform === 'win32' || process.platform === 'darwin' ? path.toLowerCase() : path;
 };
