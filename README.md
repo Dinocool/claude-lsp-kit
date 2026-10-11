@@ -279,6 +279,13 @@ implementation, declaration and typeDefinition answers are deduped and sorted
 by uri and position, never capped (the client prints its own count header);
 `hover` passes through. `LSPKIT_RAW=1` turns shaping off for that session.
 
+Diagnostics are gated the same way: a `publishDiagnostics` reaches the client
+only for a document the session has opened (`didOpen` minus `didClose`). The
+shared manager runs servers for every session's worktree, and whole-project
+pushes for files a session never looked at are other sessions' churn rendering
+into its context — measured at 92% of one session's diagnostic bytes. The same
+`LSPKIT_RAW=1` switch forwards every push.
+
 ## Settings
 
 lsp-kit gives rust-analyzer one setting, `linkedProjects` (see Per-language
