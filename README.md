@@ -365,8 +365,12 @@ or `Cargo.toml`, whose errors say why answers come back empty — or an empty
 push, a clear, always passes. The shared manager runs servers for every
 session's worktree, and whole-project pushes for code files a session never
 looked at are other sessions' churn rendering into its context — measured at
-92% of one session's diagnostic bytes. The same `LSPKIT_RAW=1` switch
-forwards every push.
+92% of one session's diagnostic bytes. Hint-severity entries (LSP severity
+4) are dropped from every push: TypeScript 7 sends its suggestions there
+("parameter implicitly has an 'any' type, but a better type may be inferred",
+"declared but never read") on every edit of an untyped file, about ten lines a
+block, and a linter reports what matters among them. Errors, warnings and
+information pass. The same `LSPKIT_RAW=1` switch forwards every push whole.
 
 ## Settings
 

@@ -45,7 +45,8 @@ const until = async (fn, ms = 3000) => {
 // the pushes they gate (each wait is far above a local round trip).
 const got = [];
 const client = startProxy('typescript', dir, { name: 'gated', LSP_KIT_PIPE: pipe });
-client.onNotification = (m) => m.method === 'textDocument/publishDiagnostics' && got.push(m.params.uri);
+const gotParams = [];
+client.onNotification = (m) => m.method === 'textDocument/publishDiagnostics' && (got.push(m.params.uri), gotParams.push(m.params));
 // Real paths under the scratch dir, so the uri spellings the proxy parses are
 // ones a client would send.
 const uriOf = (file) => pathToFileURL(join(dir, file)).href;
@@ -59,6 +60,19 @@ pushDiags(opened, ['a diagnostic']);
 pushDiags(uriOf('other-worktree.mjs'), ['another session churn']);
 await wait(400);
 check(JSON.stringify(got) === JSON.stringify([opened]), `an open document's diagnostics forwarded, an unopened served one dropped (got ${JSON.stringify(got)})`);
+
+// Hints (severity 4, TypeScript 7's suggestions) are dropped from a push that
+// passes; an error, a warning and an information entry in the same push reach
+// the client. The push still arrives, so a push of hints only is a clear.
+const range = { start: { line: 0, character: 0 }, end: { line: 0, character: 5 } };
+const severities = (params) => params.diagnostics.map((d) => d.severity);
+push({ jsonrpc: '2.0', method: 'textDocument/publishDiagnostics', params: { uri: opened, diagnostics: [1, 4, 2, 3, 4].map((severity) => ({ range, severity, message: `severity ${severity}` })) } });
+await wait(400);
+check(JSON.stringify(severities(gotParams.at(-1))) === '[1,2,3]', `an open document's hints dropped, its error, warning and information kept (got ${JSON.stringify(severities(gotParams.at(-1)))})`);
+push({ jsonrpc: '2.0', method: 'textDocument/publishDiagnostics', params: { uri: opened, diagnostics: [{ range, severity: 4, message: 'only a hint' }] } });
+await wait(400);
+check(gotParams.at(-1).diagnostics.length === 0 && got.length === 3, `a push of hints only reaches the client empty, as a clear (got ${JSON.stringify(gotParams.at(-1))})`);
+got.length = 1; // the later checks count from the first forwarded push
 
 // Project config is no language the kit serves: its errors (TypeScript 7's
 // tsconfig ones say why answers come back empty) reach the session unopened.
@@ -94,12 +108,16 @@ client.notify('exit', null);
 const rawGot = [];
 pushes.length = 0; // a late-connecting proxy is replayed the push history; the raw section starts clean
 const rawClient = startProxy('typescript', dir, { name: 'raw', LSP_KIT_PIPE: pipe, LSPKIT_RAW: '1' });
-rawClient.onNotification = (m) => m.method === 'textDocument/publishDiagnostics' && rawGot.push(m.params.uri);
+const rawParams = [];
+rawClient.onNotification = (m) => m.method === 'textDocument/publishDiagnostics' && (rawGot.push(m.params.uri), rawParams.push(m.params));
 rawClient.notify('initialized', {}); // the proxy connects to the manager on its first frame
 check(await until(() => connects >= 2), 'raw proxy connected to the fake manager');
 pushDiags(uriOf('never-opened.mjs'), ['raw passes everything']);
 await wait(400);
 check(rawGot.length === 1, 'LSPKIT_RAW=1 forwards a never-opened document (kill switch works)');
+push({ jsonrpc: '2.0', method: 'textDocument/publishDiagnostics', params: { uri: uriOf('never-opened.mjs'), diagnostics: [{ range, severity: 4, message: 'a hint' }] } });
+await wait(400);
+check(rawParams.at(-1)?.diagnostics.length === 1, 'LSPKIT_RAW=1 forwards hints too');
 rawClient.notify('exit', null);
 
 await wait(150);

@@ -37,8 +37,12 @@ const unanswered = new Map(); // client request id -> method, sent to the curren
 // non-empty publishDiagnostics for a file of a language the kit serves passes
 // only while the session has it open; a push for any other file (project
 // config such as tsconfig.json or Cargo.toml, whose errors explain empty
-// answers) or an empty one (a clear, always harmless) always passes;
-// LSPKIT_RAW=1 passes every push through, the same switch as shape.mjs.
+// answers) or an empty one (a clear, always harmless) always passes. Hint
+// entries (severity 4) are dropped from every push that passes: TypeScript 7's
+// suggestions ("a better type may be inferred", "declared but never read",
+// verified 2026-10-12) came as a ten-line block on each edit of an untyped file.
+// LSPKIT_RAW=1 passes every push through whole, the same switch as shape.mjs.
+const HINT = 4;
 const openDocs = new Set();
 const raw = process.env.LSPKIT_RAW === '1';
 // The extensions of the languages the kit serves, from the one copy of the
@@ -90,7 +94,10 @@ async function open() {
 	});
 	readFrames(socket, (msg) => {
 		if (msg.method === 'lsp-kit/log') return void process.stderr.write(msg.params.line + '\n');
-		if (!raw && msg.method === 'textDocument/publishDiagnostics' && gated(msg.params)) return;
+		if (!raw && msg.method === 'textDocument/publishDiagnostics') {
+			if (gated(msg.params)) return;
+			if (msg.params?.diagnostics) msg.params.diagnostics = msg.params.diagnostics.filter((d) => d.severity !== HINT);
+		}
 		if (msg.id != null && !msg.method) {
 			// Shape the answer before the client renders it (shape.mjs); the method
 			// comes from the request this answers.
