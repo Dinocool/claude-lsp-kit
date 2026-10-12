@@ -2,8 +2,9 @@
 
 A [Claude Code](https://claude.com/claude-code) plugin that gives the LSP tool
 **Svelte**, **TypeScript and JavaScript**, **Rust** and **Lua** language servers. It keeps them responsive in
-large repos, starts separate servers for the git worktrees agents work in, and
-shares each server among all sessions on the machine.
+large repos, follows agents into the git worktrees they work in, and shares
+each server among all sessions on the machine: one Rust, one TypeScript and
+one Svelte server serve every checkout.
 
 | Language | Extensions | Server | Served when the repo root has |
 |---|---|---|---|
@@ -25,33 +26,71 @@ a chokidar watcher over the whole workspace, ignoring only `.git` and
 `node_modules`. That includes agent worktrees under `.claude/worktrees`, which
 are full copies of the repo. On Windows the crawl kept the server busy for
 minutes, so every request timed out. lsp-kit tells each server the client
-reports file changes. It then watches each server's root itself with one
-native recursive `fs.watch`, skipping dot-directories, `node_modules` and
-`target`. Changes reach the server in batches.
+reports file changes. It then watches each of a server's workspace folders
+itself with one native recursive `fs.watch`, skipping dot-directories,
+`node_modules` and `target`. Changes reach the server in batches.
 
 **2. Roots.** Claude Code roots its servers at the session's working
 directory, which can be a subdirectory of the repo. Project config sits at the
 repo root (`.luarc.json`, the Cargo workspace, `svelte.config.*`), and LuaLS
 reads `.luarc.json` only from its workspace root, so a session started in a
-subdirectory silently lost it. Every server is rooted at a git toplevel
-instead: the session's server at the toplevel of the session directory, and
-each file's server at the toplevel of the checkout that owns it.
+subdirectory silently lost it. Every workspace folder is a git toplevel
+instead: the session's is the toplevel of the session directory, and each
+file's is the toplevel of the checkout that owns it.
 
 **3. Worktrees.** Agents edit code in linked git worktrees, nested in the
 session directory (`.claude/worktrees/<name>`) or beside it. A file in one goes
-to a server rooted at that worktree, so an agent's hover, definitions and
-references reflect its worktree's code, not main's.
+to that worktree's workspace folder, so an agent's hover, definitions and
+references reflect its worktree's code, not main's. A path belongs to the most
+specific folder holding it, so a worktree nested in main is its own folder.
 
 Git submodules belong to their superproject's server; a nested clone is its
 own checkout. Servers run in the home directory, so they never stop a
 worktree from being removed on Windows.
 
-**4. One server per checkout for the whole machine.** Without it, every
-session ran its own copy of the same index (rust-analyzer ~3.5 GB, LuaLS
-~1.4 GB each), and eight sessions on one repo exhausted a 32 GB machine.
-Every session shares one server per language and checkout, however each
-session spells the checkout's path (drive-letter case, short names,
-junctions); each session only ever sees its own spelling.
+**4. Shared servers for the whole machine.** Without them, every session ran
+its own copy of the same index (rust-analyzer ~3.5 GB, LuaLS ~1.4 GB each),
+and eight sessions on one repo exhausted a 32 GB machine. Every session shares
+the servers, however each session spells a checkout's path (drive-letter case,
+short names, junctions); each session only ever sees its own spelling.
+
+- **Rust, TypeScript and Svelte: one server for every checkout,** each
+  checkout a workspace folder of it. Measured on five checkouts of one repo:
+
+  | Server | Five servers | One server, five folders |
+  |---|---|---|
+  | rust-analyzer | 18.8 GB | 6.7 GB |
+  | TypeScript 7 | 1.7 GB | 1.1 GB |
+  | svelte-language-server | 5.6 GB | 3.6 GB |
+
+  Unsaved edits, references, definitions and workspace symbols stayed per
+  folder in all three. A checkout that resolves another server binary gets a
+  server of its own: one pinned to another toolchain by `rust-toolchain.toml`,
+  or with another TypeScript or svelte-language-server version. Checkouts
+  share by version, wherever each finds its copy.
+- **Lua: one server per checkout,** its one folder.
+- A checkout joins its server on its first request
+  (`workspace/didChangeWorkspaceFolders`). rust-analyzer ignores folder
+  changes while `linkedProjects` is set, so it also gets every folder's
+  `Cargo.toml` files together (`workspace/didChangeConfiguration`, and the
+  same answer to its `workspace/configuration` pull).
+- svelte-language-server (0.18) reads its folders only at `initialize` and
+  uses them only to accept the tsconfigs under them; a checkout outside them
+  got wrong answers. So it is told its outermost checkouts (a worktree nested
+  in main joins without a word), and a checkout outside all of them restarts
+  it with that one added; requests in flight go to the new server. A
+  `.svelte` file no tsconfig includes or imports, or a project without a
+  tsconfig, makes it search the folder holding it for `svelte.config.*` files
+  (`loadConfigs`): told a drive root, that search blocked it for minutes.
+  It parses any document it gets as Svelte (a `.ts` one corrupts its
+  references), so a request about a file of another language fails with the
+  reason, for every language.
+- Workspace symbols come back only from the folders the asking session
+  uses: those it sent a request or opened a document in. Places outside
+  every folder (a toolchain's sources) stay. Without the filter, a workspace
+  symbol came back once per checkout. References and definitions keep every
+  place: one in another checkout is real (a checkout importing another's
+  files by path).
 
 - A document stays open on a shared server until the last session that
   opened it closes it or ends. When a second session opens or changes a
@@ -74,7 +113,7 @@ junctions); each session only ever sees its own spelling.
   - Pulls don't count as use, so a server still stops when idle.
 - `workspaceSymbol` asks the session checkout's server (starting it if it
   stopped) and every other running server the session has used, and merges
-  the results.
+  the results, each filtered as above.
 
 ### Lifecycle
 
@@ -86,20 +125,29 @@ junctions); each session only ever sees its own spelling.
   digest of the manager's code: after an update that changes it, new sessions
   start a new manager and the old one ends when its last session and server
   are gone.
-- A server starts on the first request for its checkout, and stops after
-  5 minutes unused or when its directory is deleted.
+- A server starts on the first request for a checkout it would serve. A
+  checkout leaves its server after 5 minutes unused or when its directory is
+  deleted; the last one leaving stops it.
+- Servers free no memory when a folder leaves (rust-analyzer, TypeScript 7 and
+  svelte-language-server, measured; TypeScript even keeps answering the removed folder's symbols). So
+  a server not in use that has dropped folders restarts with its live ones
+  when fewer than half its peak remain, or when it is over the memory limit.
+  The new server reopens the open documents.
 - No rule stops a server in use: one with a request in flight, or used
   within the last check (a minute, or a quarter of `LSP_KIT_IDLE_MS` if
   shorter). Otherwise a session's lookup could lose its server between two
   steps, and restart it (rust-analyzer re-indexing) for the next.
-- At most 6 servers run machine-wide (`LSP_KIT_MAX_SERVERS`). Starting one
-  more stops the least recently used server not in use. If every server is
+- At most 6 servers run on the machine (`LSP_KIT_MAX_SERVERS`). Starting
+  one more stops the least recently used server not in use. If every one is
   in use, the cap is exceeded and logged.
-- The servers may use 6 GB together (`LSP_KIT_MAX_MEMORY_MB`, in MB), and
-  servers stop while the machine's free memory is under a floor (an eighth
-  of its memory, `LSP_KIT_MIN_FREE_MB`). See [Memory](#memory).
-- A server that stops, crashes or is killed starts again on the next request
-  for its checkout.
+- The servers may use a quarter of the machine's memory together
+  (`LSP_KIT_MAX_MEMORY_MB`). Servers stop while the machine's free memory is
+  under a floor (an eighth of its memory, `LSP_KIT_MIN_FREE_MB`). See
+  [Memory](#memory).
+- A crash hits every session a server serves. A server that exits unasked
+  after answering a request restarts at once with its folders, and the log
+  says so. One that stops, or dies before answering anything, starts again on
+  the next request.
 - When a session ends, its documents are released; its servers stay for
   the other sessions until they idle out. The manager exits once it has
   no connection (a session, or a proxy that hasn't said hello yet) and no
@@ -120,8 +168,10 @@ repo with a few files open (more for each project it loads). Eight sessions'
 own servers once took 24 GB and the machine ran out of commit.
 
 - On each check the manager measures each server. While the servers
-  together use more than the limit, the least recently used server not in
-  use stops. If every server left is in use, the limit is exceeded and
+  together use more than the limit, the least recently used one not in use
+  stops, or a shared one restarts with its live folders; one whose folders
+  are all live stays (stopping it frees nothing for long). If every server
+  left is in use or serves only live folders, the limit is exceeded and
   logged.
 - A server's memory is its own plus its child processes': rust-analyzer's
   proc-macro servers and cargo check use memory on its behalf, and end with
@@ -209,7 +259,7 @@ checkout, pids and the gone manager.
 - **Rust:** rust-analyzer only looks for `Cargo.toml` at the root and one
   level down. lsp-kit finds the top-level `Cargo.toml` in every subtree and
   passes them all as `linkedProjects`, so crates like `tools/foo` or
-  `app/src-tauri` get analysis. It also retries requests that get
+  `app/src-tauri` get analysis; a shared server gets every folder's. It also retries requests that get
   `ContentModified` while rust-analyzer reloads, because Claude Code doesn't.
   Under rustup, lsp-kit starts the toolchain's rust-analyzer directly
   (`rustup which rust-analyzer`, run in the server's checkout so its
@@ -233,8 +283,8 @@ checkout, pids and the gone manager.
     answer. The hooks reuse its last good answer from `lsp-kit-npm-root.json`
     in the plugin data directory. That file keeps one key: the node binary,
     the prefix setting and `~/.npmrc`.
-- **TypeScript and JavaScript:** one TypeScript 7 server per checkout serves
-  every `.ts`/`.js` flavour. TypeScript 7 (July 2026) is the native port and
+- **TypeScript and JavaScript:** one TypeScript 7 server per version serves
+  every `.ts`/`.js` flavour of every checkout. TypeScript 7 (July 2026) is the native port and
   ships its own LSP server; Microsoft's
   [announcement](https://devblogs.microsoft.com/typescript/announcing-typescript-7-0/)
   says it "should work great in any editor". It has no `tsserver`, so the
@@ -247,7 +297,11 @@ checkout, pids and the gone manager.
   announcement's side-by-side alias of `typescript@7`), then npm's global
   `typescript`. lsp-kit starts the native binary from
   `@typescript/typescript-<platform>-<arch>` directly, because the `tsc` bin
-  is a node wrapper that runs it as a child.
+  is a node wrapper that runs it as a child. A running binary can't be
+  deleted or replaced on Windows, so the shared server runs a copy of the
+  platform package, made once per version in the plugin data directory
+  (without blocking other sessions): from a checkout's `node_modules` it
+  would lock that checkout, from npm's global folder `npm i -g`.
   - **TypeScript 6 projects** (Svelte's tooling still needs 6) are served by
     TypeScript 7, with TypeScript 7's semantics. A tsconfig option TypeScript
     7 removed (`baseUrl`, say, even with `ignoreDeprecations`) is a hard error
@@ -445,7 +499,8 @@ started with, and with it its manager.
   `settings.json`) reach the manager when a session starts it:
   - `LSP_KIT_TRACE=1` adds every message to the log.
   - `LSP_KIT_MAX_SERVERS` sets the machine-wide cap (6).
-  - `LSP_KIT_MAX_MEMORY_MB` sets the machine-wide memory limit in MB (6144).
+  - `LSP_KIT_MAX_MEMORY_MB` sets the machine-wide memory limit in MB (a quarter
+    of the machine's memory).
   - `LSP_KIT_MIN_FREE_MB` sets the machine's free memory floor in MB (an
     eighth of its memory; 0 turns it off).
   - `LSP_KIT_IDLE_MS` sets the idle stop (5 minutes; the tests shorten it).
@@ -490,7 +545,10 @@ started with, and with it its manager.
 - `node test/memory.mjs <scratchDir>` sets a 1 MB limit. It checks that the
   least recently used idle Lua server stops first, then the next. A stub
   server with a request in flight never stops, and the limit is exceeded and
-  logged. A real server's measured memory is above zero and below the
+  logged; an idle stub Svelte server serving only live folders isn't stopped
+  for it either, and when a checkout outside it restarts it, the new stub
+  answers the request in flight while the old one's late error is ignored. A
+  real server's measured memory is above zero and below the
   machine's. Under a free memory floor above the machine's memory, one idle
   server stops per check, least recently used first, never the stub nor a
   server used within the last check, and none in a check that stopped a
@@ -509,7 +567,7 @@ started with, and with it its manager.
   project (npm, so the first run needs the registry or npm's cache). It checks
   definitions and references across two `.ts` files and an `.mjs` file
   importing one, that two sessions share one server, and that the manager runs
-  the native binary itself. It also checks that pulled diagnostics reach the
+  the native binary itself, copied to its data directory. It also checks that pulled diagnostics reach the
   session as pushes (after an open, and on refresh for other open files),
   that after two quick edits the last published set is always the last
   text's (20 runs), and that the TypeScript server counts toward the cap
@@ -528,6 +586,21 @@ started with, and with it its manager.
   error only cargo check finds stays published after an edit (pushed and
   pulled sets are joined), and a server whose files keep changing on disk
   still stops when idle (refresh pulls aren't use).
+- `node test/folders.mjs <scratchDir>` puts three checkouts of one repo (main,
+  a worktree nested in it, a sibling worktree beside it) on one rust-analyzer,
+  one TypeScript 7 and one svelte-language-server; main has TypeScript 7 of
+  its own, the worktrees the global one of the same version, and the server
+  runs its copy in the plugin data directory. An unsaved edit in the nested worktree shows there
+  and not in main, and the Svelte server's diagnostics for it reach its
+  session. Workspace symbols come back only from the asker's folders, a
+  `.svelte` definition into a `.ts` file stays in its worktree, a `.ts`
+  request to the Svelte session fails, and references and definitions across
+  checkouts keep both sides. The sibling joins the running servers and
+  answers (rust-analyzer loads its `Cargo.toml`; the Svelte server restarts
+  for it, resending a hover in flight in a `.svelte` file outside every
+  tsconfig, answered within 20 s). Unused worktrees leave and each server
+  restarts with main alone, which answers and stays watched; a TypeScript
+  server killed after answering restarts without a request.
 - `node test/svelte.mjs <scratchDir>` checks svelte-language-server, which
   advertises pull diagnostics but answers MethodNotFound, gets one pull and
   one log line however many changes follow.

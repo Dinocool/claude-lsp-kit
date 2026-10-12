@@ -1,7 +1,7 @@
 // The per-session connector Claude Code starts for each language:
 //   node proxy.mjs <language>   (a key of LANGUAGES)
 // It forwards the session's LSP traffic to the machine-wide manager
-// (manager.mjs), which runs ONE server per checkout for every session. If no
+// (manager.mjs), which shares its servers among every session. If no
 // manager answers on the endpoint (rpc.mjs), the proxy starts one (launch.mjs)
 // and connects; the pipe admits one listener, so racing proxies end up on one
 // manager. If the manager exits, requests it hadn't answered fail with that

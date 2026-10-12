@@ -1,8 +1,15 @@
-// The machine-wide lsp-kit manager: ONE language server per (language,
-// checkout, client initializationOptions), shared by every Claude Code session
-// on the machine. Each session's proxy.mjs connects to it over the endpoint in
-// rpc.mjs and starts it (detached) when none answers. Several sessions on one
-// checkout used to run one index each (rust-analyzer ~3.5 GB, LuaLS ~1.4 GB).
+// The machine-wide lsp-kit manager, shared by every Claude Code session on the
+// machine. Each session's proxy.mjs connects to it over the endpoint in rpc.mjs
+// and starts it (detached) when none answers. Several sessions on one checkout
+// used to run one index each (rust-analyzer ~3.5 GB, LuaLS ~1.4 GB).
+//
+// Folders: a server serves a set of workspace folders, each a checkout's git
+// toplevel, joined on its first request and left when unused (see reap). A
+// shared language (`shared` in languages.mjs) runs ONE server per server binary
+// for every checkout: on five checkouts of one repo it took a third (Rust) to
+// two thirds (TypeScript, Svelte) of five servers' memory, with unsaved edits,
+// references and workspace symbols kept per folder (measured). Any other
+// language keys its server by checkout, a folder set of one.
 //
 // Per server the manager fixes what Claude Code's client leaves out:
 // 1. Watcher fallback. Claude Code's client does not advertise
@@ -10,11 +17,11 @@
 //    whole-tree watchers (svelte-language-server's chokidar crawl starved the
 //    server for minutes in a large repo) or never notice files changed on disk.
 //    Every server is told the client supports it; changes come from ONE native
-//    recursive fs.watch per server, skipping dot-directories, node_modules and
+//    recursive fs.watch per folder, skipping dot-directories, node_modules and
 //    target.
 // 2. Roots. Project config lives at the repo root (.luarc.json, the Cargo
 //    workspace, svelte.config.*), and LuaLS reads .luarc.json only from its
-//    workspace root. Every server is rooted at a git toplevel (gitRoot in
+//    workspace root. Every folder is a git toplevel (gitRoot in
 //    languages.mjs): a session's root is the toplevel of its client's folder,
 //    and a file goes to the toplevel of the checkout that owns it.
 // 3. Worktrees. Agents edit files in linked git worktrees (e.g.
@@ -25,17 +32,18 @@
 //    environment such as LuaLS's TMP in a folder of its own, response
 //    rewrites such as the Lua documentSymbol outline).
 //
-// Lifecycle, one rule for every server: it starts on the first request for its
-// checkout; it stops after IDLE_MS unused or once its directory is gone; when a
-// start would exceed MAX_SERVERS live servers, or the servers' memory exceeds
-// MAX_MEMORY, the least recently used ones stop first; while the machine's free
-// memory is under MIN_FREE, the least recently used one stops, one per reaper
-// tick. A server in use (a request in flight, or used within the last reaper
-// tick) is never stopped; if every one is, the cap or limit is exceeded and
-// logged. A server that exits is dropped, and the next request for its
-// checkout starts a fresh one (LSP 3.17: `initialize` goes once per process).
-// The manager itself exits once it has neither sessions nor servers; a
-// session's exit only releases its documents.
+// Lifecycle, one rule for every server: it starts on the first request for a
+// folder it would serve; it stops when its last folder leaves; when a start
+// would exceed MAX_SERVERS live servers, or the servers' memory exceeds
+// MAX_MEMORY, the least recently used ones stop first (for the limit a shared
+// server restarts with its live folders instead, and one serving only live
+// folders stays). While the machine's free memory is under MIN_FREE, the least
+// recently used server stops, one per reaper tick. A server in use (a request
+// in flight, or used within the last reaper tick) is never stopped; if every
+// one is, the cap or limit is exceeded and logged. A crashed server restarts
+// (see serverClosed); else the next request starts a fresh one (LSP 3.17:
+// `initialize` goes once per process). The manager itself exits once it has
+// neither sessions nor servers; a session's exit only releases its documents.
 //
 // Sessions, the LSP 3.17 client side of each server:
 // - Ids: a session's request goes to the server under a manager id and its
@@ -50,23 +58,25 @@
 //   before they notify). A request for a document the server doesn't have open
 //   (fresh or restarted) opens it from disk first.
 // - Diagnostics go to every session with the document open, else to every
-//   session using the server.
+//   session using the file's folder.
 // - Spelling: a session keeps its own spelling of a checkout's path (drive
 //   case, 8.3 names, junctions). Documents reach the server respelled under the
-//   server's root (rust-analyzer answers nothing for a document outside its
-//   root's spelling); answers and diagnostics go back under the session's.
+//   folder's spelling on that server (rust-analyzer answers nothing for a
+//   document outside its folder's spelling); answers and diagnostics go back
+//   under the session's spelling of each folder.
 // - workspace/symbol asks the session root's server and every other live server
-//   the session has used, and merges the answers; other workspace-wide
-//   requests go to the session root's server.
+//   the session has used, and merges the answers, kept to the session's folders
+//   (see visible: each folder would answer once); other workspace-wide requests
+//   go to the session root's server.
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, watch, writeFileSync } from 'node:fs';
 import { connect, createServer } from 'node:net';
 import { freemem, totalmem, userInfo } from 'node:os';
 import { createInterface } from 'node:readline';
-import { basename, dirname, extname, isAbsolute, join, relative, sep } from 'node:path';
+import { basename, dirname, extname, isAbsolute, join, relative } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { LANGUAGES, askNpm, gitRoot } from './languages.mjs';
+import { LANGUAGES, askNpm, gitRoot, sweepCopies } from './languages.mjs';
 import { processes, sameProcess, tree } from './processes.mjs';
 import { docKey, endpoint, frame, readFrames } from './rpc.mjs';
 
@@ -77,7 +87,8 @@ const MAX_SERVERS = Number(process.env.LSP_KIT_MAX_SERVERS) || 6;
 // Eight sessions' own servers once took ~24 GB and the machine hit its commit
 // limit. A server's memory is its process tree's (processes.mjs): rust-analyzer's
 // proc-macro servers and cargo check commit memory on its behalf, and end with it.
-const MAX_MEMORY = (Number(process.env.LSP_KIT_MAX_MEMORY_MB) || 6 * 1024) * 2 ** 20;
+// One rust-analyzer serving five checkouts of a large repo used 6.7 GB.
+const MAX_MEMORY = Number(process.env.LSP_KIT_MAX_MEMORY_MB) * 2 ** 20 || totalmem() / 4;
 // The servers' own limit can't see the rest of the machine: a dozen agent
 // worktrees' servers beside the agents themselves drove free memory low enough
 // for Claude Code's low-memory reaper to kill background agents. Starting a
@@ -108,13 +119,15 @@ const DID_OPEN = 'textDocument/didOpen';
 const DID_CHANGE = 'textDocument/didChange';
 const DID_CLOSE = 'textDocument/didClose';
 const PUBLISH = 'textDocument/publishDiagnostics';
+const FOLDERS_CHANGED = 'workspace/didChangeWorkspaceFolders';
 
 const { dir, path: PIPE, log: LOG } = endpoint();
 const servers = new Map(); // share key -> live server
 const running = new Set(); // every server whose process hasn't closed, stopping ones included
 const sessions = new Set();
-const pending = new Map(); // manager request id -> { id, session, clientId, server, msg, root, since }
+const pending = new Map(); // manager request id -> { id, session, clientId, server, msg, since }
 let serverCount = 0;
+let stops = 0; // servers stopped or restarted so far (see reap)
 let sessionCount = 0;
 let ids = 0;
 
@@ -159,6 +172,7 @@ listener.listen(PIPE, () => {
 	log(`manager pid ${process.pid} on ${PIPE} (cap ${MAX_SERVERS} servers, memory limit ${size(MAX_MEMORY)}, free memory floor ${MIN_FREE ? size(MIN_FREE) : 'off'}, idle stop ${IDLE_MS / 1000} s)`);
 	askNpm().then((npm) => log(npm.dir ? `npm's global folder: ${npm.dir}` : npm.error));
 	sweep().catch((e) => log(`leftover servers not swept: ${e.message}`));
+	sweepCopies();
 	setInterval(reap, TICK_MS);
 });
 
@@ -202,7 +216,7 @@ function record() {
 		for (const [pid, p] of owned) if (!sameProcess(list, p)) owned.delete(pid);
 		for (const s of [...running].filter((s) => list.has(s.child?.pid))) {
 			s.procs = tree(list, s.child.pid);
-			for (const { pid, created } of s.procs) owned.set(pid, { pid, created, lang: s.lang.name, root: s.root, server: s.child.pid });
+			for (const { pid, created } of s.procs) owned.set(pid, { pid, created, lang: s.lang.name, root: label(s), server: s.child.pid });
 		}
 		saveRecord();
 		return list;
@@ -305,15 +319,35 @@ function removeServerDir(d) {
 
 // ---- servers ------------------------------------------------------------------
 
-function startServer(session, root, key, shareKey) {
-	const lang = session.lang;
-	const server = { lang, root, key, shareKey, no: ++serverCount, docs: new Map(), requests: new Set(), lastUsed: Date.now(), waiting: new Map(), queue: [], ready: false };
+const label = (server) => [...server.folders.values()].map((f) => f.root).join(', ');
+const workspaceFolder = (path) => ({ uri: pathToFileURL(path).href, name: basename(path) || path });
+// The folders the server is told: every one, or for a language that reads them
+// only at initialize (`foldersAtStart`, languages.mjs) those inside no other.
+const inside = (outer, f) => under(outer.key, f.key) !== null;
+const toldOf = (server) => {
+	const all = [...server.folders.values()];
+	return server.lang.foldersAtStart ? all.filter((f) => !all.some((o) => o !== f && inside(o, f))) : all;
+};
+
+// `folders` (objects of newFolder) are the server's; `start` is how it starts (languages.mjs).
+function startServer(lang, init, shareKey, folders, start) {
+	const server = { lang, init, start, key: shareKey, no: ++serverCount, folders: new Map(), roots: new Map(), peak: 0, docs: new Map(), requests: new Set(), lastUsed: Date.now(), waiting: new Map(), queue: [], ready: false };
+	for (const f of folders) addFolder(server, f);
+	server.settings = settingsOf(server);
+	server.told = toldOf(server);
 	servers.set(shareKey, server);
 	running.add(server);
-	let note;
+	// A start that prepares first (a copy, languages.mjs) spawns once it is done.
+	server.initialized = start.prepare ? start.prepare.then(() => launch(server), (e) => ((server.startError = e.message), serverClosed(server))) : launch(server);
+	return server;
+}
+
+// The process spawned and asked to initialize: its answer, once it comes.
+function launch(server) {
+	const { lang, init, start } = server;
+	if (server.stopped) return serverClosed(server); // stopped while it prepared
 	try {
-		const start = lang.server(root);
-		note = start.note;
+		if (start.error) throw new Error(start.error);
 		const { command, args } = start;
 		// cwd stays the manager's (the home directory): on Windows a process's cwd
 		// can't be deleted, which would block removing the worktree. Servers take
@@ -346,51 +380,59 @@ function startServer(session, root, key, shareKey) {
 		server.startError = e.message;
 		setImmediate(() => serverClosed(server));
 	}
-	log(`${lang.name} server #${server.no} for ${root} (${servers.size} live, pid ${server.child?.pid})`);
-	if (note) log(`${lang.name} server #${server.no}: ${note}`);
+	log(`${lang.name} server #${server.no} for ${label(server)} (${servers.size} live, pid ${server.child?.pid})`);
+	if (start.note) log(`${lang.name} server #${server.no}: ${start.note}`);
 
-	const uri = pathToFileURL(root).href;
-	const params = structuredClone(session.init ?? {});
+	const params = structuredClone(init ?? {});
 	params.processId = process.pid; // LSP 3.17: the server exits if this process dies
-	params.rootUri = uri;
-	params.rootPath = root;
-	params.workspaceFolders = [{ uri, name: root.split(sep).pop() }];
+	params.rootUri = pathToFileURL(server.told[0].root).href;
+	params.rootPath = server.told[0].root;
+	params.workspaceFolders = server.told.map((f) => workspaceFolder(f.root));
 	params.capabilities ??= {};
 	params.capabilities.workspace ??= {};
 	params.capabilities.workspace.didChangeWatchedFiles = { dynamicRegistration: true };
 	params.capabilities.workspace.diagnostics = { refreshSupport: true }; // see pullDiagnostics
-	params.initializationOptions = { ...lang.initializationOptions?.(root), ...params.initializationOptions };
-	server.initialized = request(server, 'initialize', params, true).then((result) => {
+	// A shared server hears folder changes, and pulls its settings (see configure).
+	if (lang.shared) Object.assign(params.capabilities.workspace, { workspaceFolders: true, configuration: true });
+	params.initializationOptions = server.settings;
+	return request(server, 'initialize', params, true).then((result) => {
 		if (server.closed) return;
 		server.pullsDiagnostics = !!result?.capabilities?.diagnosticProvider; // see pullDiagnostics
 		write(server, { jsonrpc: '2.0', method: 'initialized', params: {} });
 		server.ready = true;
 		for (const msg of server.queue.splice(0)) write(server, msg);
-		watchRoot(server);
 		return result;
 	});
-	return server;
 }
 
-// The process is gone: its sessions' requests fail with the reason, and the
-// next request for its checkout starts a new server.
+// The process is gone: its sessions' requests fail with the reason. A server
+// that exits unasked after answering a request restarts with its folders; else
+// the next request for one of its checkouts starts a new server. One that never
+// answered isn't restarted: a server that dies on start would loop.
 function serverClosed(server, code) {
 	server.closed = true;
 	running.delete(server);
+	const crashed = !server.stopped && server.answered && servers.get(server.key) === server;
 	drop(server);
 	if (server.ownDir) removeServerDir(server.ownDir);
-	server.exitMessage = `lsp-kit: ${server.lang.name} server #${server.no} for ${server.root} ${server.startError ? `could not start: ${server.startError}` : `exited (code ${code})`}`;
+	server.exitMessage = `lsp-kit: ${server.lang.name} server #${server.no} for ${label(server)} ${server.startError ? `could not start: ${server.startError}` : `exited (code ${code})`}`;
 	for (const entry of server.requests) settle(entry, { error: { code: -32603, message: server.exitMessage } });
 	for (const resolve of server.waiting.values()) resolve(null);
 	log(server.exitMessage.replace(/^lsp-kit: /, ''));
+	if (crashed) restart(server, 'it exited unasked');
+	else if (!server.stopped) server.folders.forEach(forget);
 }
 
 // No new message reaches a stopping or closed server (LSP 3.17: nothing but
 // `exit` after `shutdown`).
 function drop(server) {
-	if (servers.get(server.shareKey) === server) servers.delete(server.shareKey);
-	server.watcher?.close();
-	for (const s of sessions) s.uses.delete(server);
+	if (servers.get(server.key) === server) servers.delete(server.key);
+}
+
+// The folder is no session's any more.
+function forget(folder) {
+	folder.watcher?.close();
+	for (const s of sessions) s.uses.delete(folder);
 }
 
 // A session's answer, or the server's exit message once it has closed.
@@ -403,12 +445,13 @@ function write(server, msg) {
 }
 
 // Sends to a server once it is initialized (`initialize` itself goes out at once).
-// `used`: whether it counts as use for the idle stop and the cap.
-function send(server, msg, used = true) {
-	if (used) server.lastUsed = Date.now();
+function send(server, msg) {
 	if (server.ready) write(server, msg);
 	else server.queue.push(msg);
 }
+
+// Use, for the idle stop and the cap: a session's request or document in the folder.
+const use = (folder) => (folder.lastUsed = folder.server.lastUsed = Date.now());
 
 function request(server, method, params, now = false) {
 	const id = `kit:${++ids}`;
@@ -422,26 +465,56 @@ function request(server, method, params, now = false) {
 // after STOP_KILL_MS is killed.
 function stopServer(server, why) {
 	if (server.stopped) return;
+	halt(server, why);
+	server.folders.forEach(forget);
+}
+function halt(server, why) {
+	stops++;
 	drop(server);
-	log(`stopping ${server.lang.name} server #${server.no} for ${server.root} (pid ${server.child?.pid}${server.memory ? `, ${size(server.memory)}` : ''}): ${why}`);
+	log(`stopping ${server.lang.name} server #${server.no} for ${label(server)} (pid ${server.child?.pid}${server.memory ? `, ${size(server.memory)}` : ''}): ${why}`);
 	setTimeout(() => server.child?.kill(), STOP_KILL_MS).unref();
 	server.stopped = request(server, 'shutdown', null).then(() => write(server, { jsonrpc: '2.0', method: 'exit', params: null }));
+}
+
+// A new process takes over the server's live folders, documents and sessions.
+function restart(server, why) {
+	if (!server.closed) halt(server, why);
+	const folders = [...server.folders.values()];
+	const resend = server.requests.size ? `, resending ${server.requests.size} in flight` : '';
+	log(`restarting ${server.lang.name} server #${server.no} with its ${folders.length} live folder${folders.length > 1 ? 's' : ''}${resend}: ${why}`);
+	const next = startServer(server.lang, server.init, server.key, folders, server.start);
+	for (const [key, doc] of server.docs) syncFromDisk(next, key, doc.uri, doc.version, doc.holders, doc.folder);
+	// A planned restart resends what was in flight (a crash settled it with the
+	// reason): the first answer settles it, a later one finds nothing pending.
+	for (const entry of server.requests) {
+		entry.server = next;
+		next.requests.add(entry);
+		send(next, entry.msg);
+	}
+	server.requests.clear();
 }
 
 const busy = (server) => server.requests.size > 0 || server.waiting.size > 0;
 // No rule stops a server in use. Used within the last tick counts: under
 // pressure from outside the servers, the floor would otherwise stop a server
 // between two steps of a session's lookup, restart it for the next and stop it
-// again (rust-analyzer re-indexing each time).
+// again (rust-analyzer re-indexing each time). A folder is in use the same way.
 const inUse = (server) => busy(server) || Date.now() - server.lastUsed < TICK_MS;
+const folderInUse = (folder) => busy(folder.server) || Date.now() - folder.lastUsed < TICK_MS;
 
 // One stopping rule for the cap, the memory limit and the free memory floor:
-// while `isOver()`, the least recently used server not in use stops. False
-// when every server left is in use (the cap or limit is then exceeded and
-// logged).
-function stopLeastRecent(isOver, why) {
-	const idle = [...servers.values()].filter((s) => !inUse(s)).sort((a, b) => a.lastUsed - b.lastUsed);
-	while (isOver() && idle.length) stopServer(idle.shift(), why);
+// while `isOver()`, the least recently used server not in use stops. For the
+// memory limit (`lasting`) only what frees memory for good counts: a
+// per-checkout server stops, a shared one that dropped folders restarts, and a
+// shared one whose folders are all live stays. False when none is left (the cap
+// or limit is then exceeded and logged).
+function stopLeastRecent(isOver, why, lasting = false) {
+	const idle = [...servers.values()].filter((s) => !inUse(s) && (!lasting || !s.lang.shared || s.folders.size < s.peak)).sort((a, b) => a.lastUsed - b.lastUsed);
+	while (isOver() && idle.length) {
+		const s = idle.shift();
+		if (lasting && s.lang.shared) restart(s, why);
+		else stopServer(s, why);
+	}
 	return !isOver();
 }
 
@@ -452,10 +525,12 @@ function makeRoom() {
 
 // On the reaper tick: every server's process tree recorded (see sweep) and its
 // memory measured, logged when it moved MEMORY_LOG_CHANGE; then stopLeastRecent
-// while the total exceeds MAX_MEMORY. A server that alone exceeds the limit is
-// no exception: it can't fit beside any other, and a leak that size is what the
-// limit is for. It stops whenever it is not in use, after any idle server
-// used less recently, and the log says so once, loudly.
+// (lasting) while the total exceeds MAX_MEMORY. A per-checkout server that alone
+// exceeds the limit is no exception: it can't fit beside any other, and a leak
+// that size is what the limit is for. It stops whenever it is not in use, after
+// any idle server used less recently, and the log says so once, loudly. A
+// shared server whose folders are all live serves them all: stopping it would
+// free nothing the next request doesn't take back.
 // A measurement still running when the next tick comes (a slow process listing)
 // skips that tick's: two would race to record and to stop servers.
 let measuring = false;
@@ -472,12 +547,12 @@ function measure() {
 				}
 				if (s.memory > MAX_MEMORY && !s.overAlone) {
 					s.overAlone = true;
-					log(`${s.lang.name} server #${s.no} ALONE uses ${size(s.memory)}, over the memory limit of ${size(MAX_MEMORY)}: it stops whenever it is not in use (LSP_KIT_MAX_MEMORY_MB sets the limit)`);
+					log(`${s.lang.name} server #${s.no} ALONE uses ${size(s.memory)}, over the memory limit of ${size(MAX_MEMORY)}${s.lang.shared ? '' : ': it stops whenever it is not in use'} (LSP_KIT_MAX_MEMORY_MB sets the limit)`);
 				}
 			}
 			const total = () => [...servers.values()].reduce((n, s) => n + (s.memory ?? 0), 0);
-			if (!stopLeastRecent(() => total() > MAX_MEMORY, `over the memory limit of ${size(MAX_MEMORY)}`))
-				log(`every server left is in use: their ${size(total())} exceed the memory limit of ${size(MAX_MEMORY)}`);
+			if (!stopLeastRecent(() => total() > MAX_MEMORY, `over the memory limit of ${size(MAX_MEMORY)}`, true))
+				log(`every server left is in use or serves only live folders: their ${size(total())} exceed the memory limit of ${size(MAX_MEMORY)}`);
 		},
 		(e) => log(`memory not measured, so its limit wasn't applied and its servers not recorded this time: ${e.message}`)
 	).finally(() => (measuring = false));
@@ -498,18 +573,27 @@ function measure() {
 // getConnections counts accepted sockets until they close
 // (https://nodejs.org/api/net.html#servergetconnectionscallback).
 //
+// A folder leaving frees no memory (rust-analyzer, TypeScript 7 and
+// svelte-language-server, measured; TypeScript even keeps answering its
+// symbols). So a server not in use that dropped folders restarts with its live
+// ones once fewer than half its peak remain (or over the memory limit, see measure).
+//
 // The free memory floor stops at most one server per tick, counting this tick's
 // other stops: a stopped server's memory is freed only as its processes exit,
 // so the next tick's reading is the first to show it, and stopping until this
 // one's reading cleared the floor would stop every idle server at once.
 function reap() {
-	const live = servers.size;
-	for (const s of servers.values()) {
-		if (!existsSync(s.root)) stopServer(s, 'its directory is gone');
-		else if (!inUse(s) && Date.now() - s.lastUsed > IDLE_MS) stopServer(s, `unused for ${IDLE_MS / 1000} s`);
+	const before = stops;
+	for (const s of [...servers.values()]) {
+		for (const f of [...s.folders.values()]) {
+			if (!existsSync(f.root)) removeFolder(f, 'its directory is gone');
+			else if (!folderInUse(f) && Date.now() - f.lastUsed > IDLE_MS) removeFolder(f, `unused for ${IDLE_MS / 1000} s`);
+		}
+		const live = s.folders.size;
+		if (!s.stopped && !inUse(s) && live < s.peak / 2) restart(s, `${live} of its peak ${s.peak} folders left`);
 	}
 	const free = freemem();
-	stopLeastRecent(() => servers.size === live && free < MIN_FREE, `the machine has ${size(free)} free, under the floor of ${size(MIN_FREE)}`);
+	stopLeastRecent(() => stops === before && free < MIN_FREE, `the machine has ${size(free)} free, under the floor of ${size(MIN_FREE)}`);
 	measure();
 	// Unlisten first: a proxy that connects from now on starts a new manager.
 	listener.getConnections((e, connections) => connections === 0 && !running.size && listener.close(() => process.exit(0)));
@@ -518,49 +602,144 @@ function reap() {
 // One key per checkout, however a client spells it (drive-letter case, 8.3
 // short names, subst drives, junctions, symlinks): realpathSync.native is the
 // true path (Node fs docs: realpath(3); libuv uv_fs_realpath:
-// GetFinalPathNameByHandleW on Windows). Only the key is canonical: a server is
-// rooted in the spelling of the session that started it (its own root's for
-// its session root, else the first request's).
+// GetFinalPathNameByHandleW on Windows). Only the key is canonical: a folder is
+// spelled as the session that added it spells it (its own root's for its
+// session root, else the first request's).
 const keyOf = (root) => realpathSync.native(root);
 
-// The session's server for a checkout root in the session's spelling, started if
-// none runs. The share key: language, checkout and the client's own
-// initializationOptions (the language's part derives from the checkout alone).
-function serverFor(session, root) {
+// The session's folder for a checkout root in the session's spelling, on the
+// server its language runs for it: the one holding it, else the one its
+// server binary shares (started if none runs). The share key: language, the
+// client's own initializationOptions (the language's part derives from the
+// folders), and for a shared language the binary (identity), else the
+// checkout. The binary is resolved once per join (rustup reads the
+// checkout's rust-toolchain.toml). Counts as use.
+function folderFor(session, root) {
 	const key = keyOf(root);
 	if (key === session.rootKey) root = session.root;
-	const shareKey = `${session.language}\n${key}\n${session.options}`;
-	let server = servers.get(shareKey);
+	const { lang } = session;
+	const prefix = `${session.language}\n${session.options}\n`;
+	let server = [...servers.values()].find((s) => s.key.startsWith(prefix) && s.folders.has(key));
 	if (!server) {
-		makeRoom();
-		server = startServer(session, root, key, shareKey);
+		let start;
+		try {
+			start = lang.server(root);
+		} catch (e) {
+			start = { error: e.message };
+		}
+		const shareKey = prefix + (lang.shared && !start.error ? (start.identity ?? start.command) : key);
+		server = servers.get(shareKey);
+		if (server) addFolder(server, newFolder(lang, key, root), start.note);
+		else {
+			makeRoom();
+			server = startServer(lang, session.init, shareKey, [newFolder(lang, key, root)], start);
+		}
 	}
-	session.uses.set(server, root);
-	return server;
+	const folder = server.folders.get(key);
+	session.uses.set(folder, root);
+	use(folder);
+	return folder;
+}
+
+// A checkout's folder on a server: its spelling there, its own settings
+// (languages.mjs), its use and its watcher.
+const newFolder = (lang, key, root) => ({ key, root, lastUsed: Date.now(), settings: lang.settings?.(root) });
+
+// The folder joins the server; a running one hears it, and the log the
+// checkout's `note` (languages.mjs).
+function addFolder(server, folder, note) {
+	folder.server = server;
+	server.folders.set(folder.key, folder);
+	server.roots.set(folder.key, folder.root);
+	server.peak = Math.max(server.peak, server.folders.size);
+	folder.watcher ??= watchFolder(folder);
+	if (!server.initialized) return; // the initialize params carry it
+	log(`${server.lang.name} server #${server.no} adds ${folder.root} (${server.folders.size} folders)${note ? `: ${note}` : ''}`);
+	// A language that reads its folders only at initialize restarts for one outside them.
+	if (!server.lang.foldersAtStart) send(server, { jsonrpc: '2.0', method: FOLDERS_CHANGED, params: { event: { added: [workspaceFolder(folder.root)], removed: [] } } });
+	else if (!server.told.some((t) => inside(t, folder))) return restart(server, `${folder.root} is outside the folders it was started with`);
+	configure(server);
+}
+
+// The folder leaves its server, with its documents; the last one stops it.
+function removeFolder(folder, why) {
+	const server = folder.server;
+	if (server.folders.size === 1) return stopServer(server, why);
+	server.folders.delete(folder.key);
+	forget(folder);
+	for (const [key, doc] of server.docs) {
+		if (doc.folder !== folder) continue;
+		server.docs.delete(key);
+		send(server, { jsonrpc: '2.0', method: DID_CLOSE, params: { textDocument: { uri: doc.uri } } });
+	}
+	log(`${server.lang.name} server #${server.no} drops ${folder.root} (${server.folders.size} of its peak ${server.peak} folders left): ${why}`);
+	if (!server.lang.foldersAtStart) send(server, { jsonrpc: '2.0', method: FOLDERS_CHANGED, params: { event: { added: [], removed: [workspaceFolder(folder.root)] } } });
+	configure(server);
+}
+
+// The server's settings: its folders' own (languages.mjs) joined, arrays
+// concatenated, under the client's initializationOptions. rust-analyzer ignores
+// folder changes while its linkedProjects is set, so a server with a settings
+// section hears every change (didChangeConfiguration; rust-analyzer then pulls
+// workspace/configuration, answered from SERVER_REQUESTS).
+function settingsOf(server) {
+	const joined = {};
+	for (const f of server.folders.values()) for (const [k, v] of Object.entries(f.settings ?? {})) joined[k] = [...(joined[k] ?? []), ...v];
+	return { ...joined, ...server.init?.initializationOptions };
+}
+function configure(server) {
+	server.settings = settingsOf(server);
+	if (server.lang.section) send(server, { jsonrpc: '2.0', method: 'workspace/didChangeConfiguration', params: { settings: { [server.lang.section]: server.settings } } });
 }
 
 // ---- spelling -----------------------------------------------------------------
 
-// `uri` (a file under `from`) respelled under `to`.
-function respell(uri, from, to) {
-	if (from === to || !uri.startsWith('file:')) return uri;
-	const rel = relative(from, fileURLToPath(uri));
-	return rel.startsWith('..') || isAbsolute(rel) ? uri : pathToFileURL(join(to, rel)).href;
+// `path` relative to `root`, or null when it isn't under it.
+const under = (root, path) => {
+	const rel = relative(root, path);
+	return rel.startsWith('..') || isAbsolute(rel) ? null : rel;
+};
+// `uri` respelled by the first [from, to] pair whose `from` holds it.
+function respell(uri, pairs) {
+	if (!uri.startsWith('file:')) return uri;
+	for (const [from, to] of pairs) {
+		const rel = under(from, fileURLToPath(uri));
+		if (rel !== null) return from === to ? uri : pathToFileURL(join(to, rel)).href;
+	}
+	return uri;
 }
 // Every file URI in an answer (values and keys, e.g. WorkspaceEdit.changes)
-// respelled from the server's root to the session's.
-function respellAll(value, from, to) {
-	if (from === to) return value;
+// respelled from the server's spelling of each folder to the session's.
+function respellAll(value, server, session) {
+	const pairs = [...server.roots].map(([key, root]) => [root, session.uses.get(server.folders.get(key)) ?? root]).sort((a, b) => b[0].length - a[0].length);
+	if (pairs.every(([from, to]) => from === to)) return value;
 	const walk = (v) =>
 		typeof v === 'string'
-			? respell(v, from, to)
+			? respell(v, pairs)
 			: Array.isArray(v)
 				? v.map(walk)
 				: v && typeof v === 'object'
-					? Object.fromEntries(Object.entries(v).map(([k, x]) => [respell(k, from, to), walk(x)]))
+					? Object.fromEntries(Object.entries(v).map(([k, x]) => [respell(k, pairs), walk(x)]))
 					: v;
 	return walk(value);
 }
+// The key of the most specific folder the server was ever given that holds
+// `uri`, else null.
+function ownerOf(server, uri) {
+	if (typeof uri !== 'string' || !uri.startsWith('file:')) return null;
+	const path = fileURLToPath(uri);
+	let owner = null;
+	for (const [key, root] of server.roots) if (under(root, path) !== null && root.length > (server.roots.get(owner)?.length ?? -1)) owner = key;
+	return owner;
+}
+// The symbols of a workspace/symbol answer the session may see: in a folder it
+// uses, or outside every folder the server was given (a toolchain's sources).
+// A folder the server dropped is no one's, and TypeScript 7 still answers for it.
+const visible = (server, session, symbols) =>
+	symbols.filter((s) => {
+		const key = ownerOf(server, s.location?.uri);
+		return key === null || session.uses.has(server.folders.get(key));
+	});
 const withDocUri = (params, uri) =>
 	params.textDocument ? { ...params, textDocument: { ...params.textDocument, uri } } : { ...params, item: { ...params.item, uri } };
 
@@ -570,7 +749,7 @@ const withDocUri = (params, uri) =>
 // registered nowhere and gets no log lines (the pipe's default ACL lets other
 // local users connect).
 function attach(socket) {
-	const session = { no: ++sessionCount, socket, uses: new Map(), pending: new Map() }; // uses: server -> the session's spelling of its root
+	const session = { no: ++sessionCount, socket, uses: new Map(), pending: new Map() }; // uses: folder -> the session's spelling of its root
 	socket.on('error', () => {}); // 'close' follows
 	socket.on('close', () => detach(session));
 	// A message the manager can't handle (malformed, or its checkout vanished
@@ -637,7 +816,7 @@ function fromSession(session, msg) {
 	trace('=>', `s${session.no}`, msg);
 	if (msg.method === 'initialize') {
 		begin(session, msg.params);
-		const home = serverFor(session, session.root);
+		const home = folderFor(session, session.root).server;
 		home.initialized.then((result) => answer(session, msg.id, home, result));
 		return;
 	}
@@ -657,31 +836,37 @@ function fromSession(session, msg) {
 		return;
 	}
 	const uri = docUri(msg.params);
+	// A server parses any document it gets as its own language (svelte-language-server
+	// parses a .ts as Svelte, and its references go wrong after).
+	const path = uri?.startsWith('file:') && fileURLToPath(uri);
+	if (path && !Object.hasOwn(session.lang.extensionToLanguage, extname(path).toLowerCase())) throw new Error(`${path} is no ${session.lang.name} file`);
 	if (!uri) {
+		const home = folderFor(session, session.root);
 		if (msg.method === 'workspace/symbol') {
 			// The session root's server (started if stopped) plus every other live one it has used.
-			const home = serverFor(session, session.root);
-			const asked = [...session.uses.keys()].filter((s) => s === home || s.ready);
-			Promise.all(asked.map((s) => request(s, msg.method, msg.params).then((a) => respellAll(a ?? [], s.root, session.uses.get(s) ?? s.root))))
-				.then((answers) => answer(session, msg.id, home, answers.flat()))
+			const asked = new Set([...session.uses.keys()].map((f) => f.server).filter((s) => s === home.server || s.ready));
+			for (const f of session.uses.keys()) if (asked.has(f.server)) use(f);
+			Promise.all([...asked].map((s) => request(s, msg.method, msg.params).then((a) => respellAll(visible(s, session, a ?? []), s, session))))
+				.then((answers) => answer(session, msg.id, home.server, answers.flat()))
 				.catch((e) => toSession(session, { jsonrpc: '2.0', id: msg.id, error: { code: -32603, message: `lsp-kit: ${e.message}` } }));
-		} else if (msg.method === 'workspace/didChangeConfiguration') for (const s of session.uses.keys()) send(s, msg);
-		else route(session, serverFor(session, session.root), msg, session.root);
+		} else if (msg.method === 'workspace/didChangeConfiguration') for (const s of new Set([...session.uses.keys()].map((f) => f.server))) send(s, msg);
+		else route(session, home, msg);
 		return;
 	}
 	// The git toplevel owning the file, in the session's spelling, else the session root.
-	const root = (uri.startsWith('file:') && gitRoot(dirname(fileURLToPath(uri)))) || session.root;
+	const root = (path && gitRoot(dirname(path))) || session.root;
 	// Closing never starts a server: a stopped one has nothing open.
-	const server = msg.method === DID_CLOSE ? [...session.uses.keys()].find((s) => s.key === keyOf(root)) : serverFor(session, root);
-	if (!server) return;
-	const serverUri = respell(uri, root, server.root);
+	const folder = msg.method === DID_CLOSE ? [...session.uses.keys()].find((f) => f.key === keyOf(root)) : folderFor(session, root);
+	if (!folder) return;
+	const { server } = folder;
+	const serverUri = respell(uri, [[root, folder.root]]);
 	if (serverUri !== uri) msg = { ...msg, params: withDocUri(msg.params, serverUri) };
 	const key = docKey(serverUri);
 	const doc = server.docs.get(key);
 	const version = msg.params.textDocument?.version ?? 0;
 	if (msg.method === DID_CLOSE) return closeDoc(server, key, session);
 	if (!doc && msg.method === DID_OPEN) {
-		server.docs.set(key, { uri: serverUri, holders: new Set([session]), owner: session, version });
+		server.docs.set(key, { uri: serverUri, folder, holders: new Set([session]), owner: session, version });
 		return sendDoc(server, msg);
 	}
 	if (msg.method === DID_CHANGE && doc?.owner === session) {
@@ -691,16 +876,16 @@ function fromSession(session, msg) {
 	const sync = msg.method === DID_OPEN || msg.method === DID_CHANGE;
 	// The server's copy isn't this session's (or the server lacks the document):
 	// load it from disk, which already holds any edit the session reports.
-	if (sync || !doc) syncFromDisk(server, key, serverUri, version, session);
-	if (!sync) route(session, server, msg, root);
+	if (sync || !doc) syncFromDisk(server, key, serverUri, version, new Set([session]), folder);
+	if (!sync) route(session, folder, msg);
 }
 
-// The server's copy of the document set to the file on disk, `session` among
+// The server's copy of the document set to the file on disk, `holders` among
 // its holders. An open document gets the whole text as one change (LSP 3.17
 // TextDocumentContentChangeEvent without a range), not a close and reopen:
 // after a quick close and reopen, LuaLS's last diagnostics for the file came
 // without its warnings in one of four test/shared.mjs runs.
-function syncFromDisk(server, key, uri, version, session) {
+function syncFromDisk(server, key, uri, version, holders, folder) {
 	let text;
 	try {
 		text = readFileSync(fileURLToPath(uri), 'utf8');
@@ -709,10 +894,10 @@ function syncFromDisk(server, key, uri, version, session) {
 	}
 	const doc = server.docs.get(key);
 	if (!doc) {
-		server.docs.set(key, { uri, holders: new Set([session]), owner: null, version });
+		server.docs.set(key, { uri, folder, holders, owner: null, version });
 		return sendDoc(server, { jsonrpc: '2.0', method: DID_OPEN, params: { textDocument: { uri, languageId: server.lang.extensionToLanguage[extname(uri)], version, text } } });
 	}
-	doc.holders.add(session);
+	holders.forEach((h) => doc.holders.add(h));
 	doc.owner = null;
 	sendDoc(server, { jsonrpc: '2.0', method: DID_CHANGE, params: { textDocument: { uri: doc.uri, version: ++doc.version }, contentChanges: [{ text }] } });
 }
@@ -764,14 +949,14 @@ function pullDiagnostics(server, key, refresh = false) {
 		if (result?.kind === 'full') publishDoc(server, doc, { pulled: result.items });
 		if (doc.repull) pullDiagnostics(server, key);
 	});
-	send(server, { jsonrpc: '2.0', id, method: 'textDocument/diagnostic', params: { textDocument: { uri: doc.uri } } }, false);
+	send(server, { jsonrpc: '2.0', id, method: 'textDocument/diagnostic', params: { textDocument: { uri: doc.uri } } });
 }
 
 // The document's pushed or pulled set replaced; their union goes to its holders.
 function publishDoc(server, doc, sets) {
 	Object.assign(doc, sets);
 	const params = { uri: doc.uri, diagnostics: [...(doc.pushed ?? []), ...(doc.pulled ?? [])] };
-	for (const s of doc.holders) toSession(s, respellAll({ jsonrpc: '2.0', method: PUBLISH, params }, server.root, s.uses.get(server) ?? server.root));
+	for (const s of doc.holders) toSession(s, respellAll({ jsonrpc: '2.0', method: PUBLISH, params }, server, s));
 }
 
 // The session no longer holds the document; the last holder's close reaches the server.
@@ -784,11 +969,11 @@ function closeDoc(server, key, session) {
 	send(server, { jsonrpc: '2.0', method: DID_CLOSE, params: { textDocument: { uri: doc.uri } } });
 }
 
-// A session request (or notification) to a server; `root` is the session's
-// spelling of the server's checkout, for the answer.
-function route(session, server, msg, root) {
+// A session request (or notification) to the server of one of its folders.
+function route(session, folder, msg) {
+	const { server } = folder;
 	if (msg.id == null) return send(server, msg);
-	const entry = { id: `kit:${++ids}`, session, clientId: msg.id, server, root, since: Date.now() };
+	const entry = { id: `kit:${++ids}`, session, clientId: msg.id, server, since: Date.now() };
 	entry.msg = { ...msg, id: entry.id };
 	pending.set(entry.id, entry);
 	session.pending.set(msg.id, entry);
@@ -801,17 +986,19 @@ function settle(entry, reply) {
 	pending.delete(entry.id);
 	entry.session.pending.delete(entry.clientId);
 	entry.server.requests.delete(entry);
-	const rewrite = reply.result && entry.server.lang.results?.[entry.msg.method];
-	const result = respellAll(rewrite ? rewrite(reply.result) : reply.result, entry.server.root, entry.root);
-	toSession(entry.session, reply.error ? { jsonrpc: '2.0', id: entry.clientId, error: reply.error } : { jsonrpc: '2.0', id: entry.clientId, result });
+	const { server, session, msg } = entry;
+	const rewrite = server.lang.results?.[msg.method];
+	const result = respellAll(rewrite && reply.result ? rewrite(reply.result) : reply.result, server, session);
+	toSession(session, reply.error ? { jsonrpc: '2.0', id: entry.clientId, error: reply.error } : { jsonrpc: '2.0', id: entry.clientId, result });
 }
 
 // ---- servers -> sessions ------------------------------------------------------
 
 // Server->client requests, answered here: no default (null) is wrong for these.
 const SERVER_REQUESTS = {
-	'workspace/configuration': (params) => params.items.map(() => null), // one null per item: "can't provide"
-	'workspace/workspaceFolders': (params, server) => [{ uri: pathToFileURL(server.root).href, name: server.root.split(sep).pop() }],
+	// One null per item ("can't provide"), but the server's own settings section (see configure).
+	'workspace/configuration': (params, server) => params.items.map((i) => (server.lang.section && i.section === server.lang.section ? server.settings : null)),
+	'workspace/workspaceFolders': (params, server) => server.told.map((f) => workspaceFolder(f.root)),
 	'workspace/diagnostic/refresh': (params, server) => void [...server.docs.keys()].forEach((key) => pullDiagnostics(server, key, true))
 };
 
@@ -824,8 +1011,9 @@ function fromServer(server, msg) {
 			resolve(msg);
 			return;
 		}
+		// A restart resent the request: only its current server answers it.
 		const entry = pending.get(msg.id);
-		if (!entry) return;
+		if (entry?.server !== server) return;
 		// rust-analyzer answers ContentModified while it (re)loads the workspace; the
 		// spec leaves the retry to the client, which Claude Code doesn't do.
 		if (msg.error?.code === CONTENT_MODIFIED && Date.now() - entry.since < RETRY_WINDOW_MS) {
@@ -833,10 +1021,11 @@ function fromServer(server, msg) {
 			setTimeout(() => {
 				if (pending.get(entry.id) !== entry) return;
 				entry.retrying = false;
-				send(server, entry.msg);
+				send(entry.server, entry.msg);
 			}, RETRY_MS);
 			return;
 		}
+		server.answered = true; // see serverClosed
 		settle(entry, msg);
 		return;
 	}
@@ -845,21 +1034,27 @@ function fromServer(server, msg) {
 	if (msg.method === '$/progress') return;
 	const doc = msg.method === PUBLISH && server.docs.get(docKey(msg.params.uri));
 	if (doc) return publishDoc(server, doc, { pushed: msg.params.diagnostics });
-	for (const s of [...sessions].filter((s) => s.uses.has(server))) toSession(s, respellAll(msg, server.root, s.uses.get(server) ?? server.root));
+	// A push for a file not open goes to the sessions using its folder; anything
+	// else to every session using the server.
+	const owner = msg.method === PUBLISH ? ownerOf(server, msg.params.uri) : null;
+	const reaches = (s) => (owner !== null ? s.uses.has(server.folders.get(owner)) : [...s.uses.keys()].some((f) => f.server === server));
+	for (const s of [...sessions].filter(reaches)) toSession(s, respellAll(msg, server, s));
 }
 
 // ---- file watching ------------------------------------------------------------
 
-function watchRoot(server) {
-	const watchExts = new Set(server.lang.watch);
+// One watcher per folder, from its join until it is forgotten: the changes go
+// to whichever server holds the folder now (a restart moves it) once it is ready.
+function watchFolder(folder) {
+	const watchExts = new Set(folder.server.lang.watch);
 	let changed = new Map();
 	let timer = null;
 	try {
-		server.watcher = watch(server.root, { recursive: true }, (event, filename) => {
+		const watcher = watch(folder.root, { recursive: true }, (event, filename) => {
 			if (!filename) return;
 			const parts = filename.split(/[\\/]/);
 			if (parts.some((d) => d === 'node_modules' || d === 'target' || (d.startsWith('.') && d !== '.svelte-kit'))) return;
-			const path = join(server.root, filename);
+			const path = join(folder.root, filename);
 			const exists = existsSync(path);
 			if (watchExts.has(extname(filename))) {
 				changed.set(path, event === 'change' ? FILE_CHANGE.Changed : exists ? FILE_CHANGE.Created : FILE_CHANGE.Deleted);
@@ -873,11 +1068,12 @@ function watchRoot(server) {
 				const changes = [...changed].map(([p, type]) => ({ uri: pathToFileURL(p).href, type }));
 				changed = new Map();
 				timer = null;
-				if (servers.get(server.shareKey) === server) write(server, { jsonrpc: '2.0', method: WATCHED_FILES, params: { changes } });
+				const { server } = folder;
+				if (servers.get(server.key) === server) send(server, { jsonrpc: '2.0', method: WATCHED_FILES, params: { changes } });
 			}, 50);
 		});
-		server.watcher.on('error', (e) => log(`watching ${server.root} failed: ${e.message}`));
+		return watcher.on('error', (e) => log(`watching ${folder.root} failed: ${e.message}`));
 	} catch (e) {
-		log(`watching ${server.root} failed: ${e.message}`);
+		log(`watching ${folder.root} failed: ${e.message}`);
 	}
 }

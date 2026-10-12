@@ -8,7 +8,7 @@
 // side-by-side alias of TypeScript 7.
 // Usage: node test/typescript.mjs <scratchDir>   (needs npm, git and lua-language-server)
 import { execSync } from 'node:child_process';
-import { mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { basename, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { LANGUAGES } from '../plugins/lsp-kit/languages.mjs';
@@ -54,6 +54,11 @@ const same = (got, want) => JSON.stringify(got) === JSON.stringify(want);
 // ---- navigation, two sessions on one server -----------------------------------------
 const data = join(process.argv[2], 'data');
 const shared = { LSP_KIT_PIPE: privatePipe(), CLAUDE_PLUGIN_DATA: data, LSP_KIT_TRACE: '1' }; // the manager's log traces every message
+// Half-made copies: one by a process that is gone, one by a live one (this test).
+const gonePid = Number(execSync(`"${process.execPath}" -p process.pid`).toString());
+const stale = join(data, `lsp-kit-typescript-0.0.0-stub.${gonePid}.part`);
+const copying = join(data, `lsp-kit-typescript-0.0.0-stub.${process.pid}.part`);
+[stale, copying].forEach((d) => mkdirSync(d, { recursive: true }));
 const a = startProxy('typescript', repo, { ...shared, name: 'a' });
 const b = startProxy('typescript', repo, { ...shared, name: 'b' });
 await a.initialize(repo);
@@ -72,7 +77,11 @@ const starts = a.stderr.filter((l) => / live, pid /.test(l));
 check(starts.length === 1, `one server for both sessions: ${starts.length} start line(s)`);
 const [pid] = a.pids();
 const exe = processPath(pid);
-check(/^tsc(\.exe)?$/i.test(basename(exe)) && exe.includes(join('node_modules', '@typescript')), `the manager holds the native compiler itself, the project's own TypeScript 7 (pid ${pid} is ${exe})`);
+// The project's runs from a copy in the plugin data folder: a running tsc
+// would lock the checkout's node_modules.
+check(/^tsc(\.exe)?$/i.test(basename(exe)) && exe.toLowerCase().startsWith(join(data, 'lsp-kit-typescript-').toLowerCase()), `the manager holds the native compiler itself, a copy of the project's TypeScript 7 outside the checkout (pid ${pid} is ${exe})`);
+check(!existsSync(stale) && existsSync(copying), "the manager's start removed the copy half made by a process that is gone, not the live one's");
+rmSync(copying, { recursive: true });
 
 // ---- diagnostics: TypeScript 7 only answers pulls; the client gets them pushed -------
 const pushed = new Map(); // file name -> latest diagnostics messages

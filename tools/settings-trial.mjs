@@ -116,7 +116,7 @@ function start(candidate) {
 		},
 		general: { positionEncodings: ['utf-16'] }
 	};
-	const initializationOptions = { ...lang.initializationOptions?.(root), ...candidate.init };
+	const initializationOptions = { ...lang.settings?.(root), ...candidate.init };
 	const ready = request('initialize', { processId: process.pid, rootUri: uri, rootPath: root, workspaceFolders: [{ uri, name: 'trial' }], capabilities, initializationOptions }).then(
 		(r) => (send({ method: 'initialized', params: {} }), r.result)
 	);

@@ -14,7 +14,7 @@
 // logged and the manager goes on serving.
 // Usage: node test/memory.mjs <scratchDir>   (needs lua-language-server and git)
 import { execFileSync, execSync, spawn } from 'node:child_process';
-import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
+import { chmodSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, writeFileSync } from 'node:fs';
 import { totalmem, userInfo } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -33,6 +33,7 @@ writeFileSync(join(repo, 'a.svelte'), '<p>stub</p>\n');
 // The project's own svelte-language-server comes first (languages.mjs): the stub.
 const stub = join(repo, 'node_modules', 'svelte-language-server', 'bin', 'server.js');
 mkdirSync(join(stub, '..'), { recursive: true });
+writeFileSync(join(stub, '..', '..', 'package.json'), '{ "name": "svelte-language-server", "version": "0.0.0-stub" }\n');
 writeFileSync(stub, `import(${JSON.stringify(new URL('./stub-server.mjs', import.meta.url).href)});\n`);
 sh('git init -q && git add -A && git -c user.email=t@t -c user.name=t commit -qm init');
 sh('git worktree add -q .claude/worktrees/wt');
@@ -81,7 +82,8 @@ await svelte.initialize(repo);
 svelte.req('textDocument/hover', { textDocument: { uri: pathToFileURL(join(repo, 'a.svelte')).href }, position: { line: 0, character: 1 } }); // never answered
 
 const memoryStops = () => lua.stderr.map((l) => /stopping (\w+) server #(\d+) .*over the memory limit/.exec(l)).filter(Boolean).map((m) => `${m[1]} #${m[2]}`);
-const exceeded = () => lua.stderr.some((l) => /every server left is in use: their .* exceed the memory limit of 1 MB/.test(l));
+// The stub is shared and serves only live folders: the limit never stops it.
+const exceeded = () => lua.stderr.some((l) => /every server left is in use or serves only live folders: their .* exceed the memory limit of 1 MB/.test(l));
 await until(() => memoryStops().length >= 2 && exceeded(), 45000);
 check(memoryStops().join(', ') === 'Lua #1, Lua #2', `over the limit, the least recently used idle server stops first, then the next (${memoryStops().join(', ')})`);
 check(exceeded(), 'with only the server with a request in flight left, the limit is exceeded and logged');
@@ -90,6 +92,34 @@ const reading = lua.stderr.map((l) => /Lua server #1 \(pid \d+, \d+ process(?:es
 const used = reading && bytes(reading[1], reading[2]);
 check(used > 0 && used < totalmem(), `a real server's measured memory is plausible: ${reading?.slice(1).join(' ')} of the machine's ${(totalmem() / 2 ** 30).toFixed(1)} GB`);
 check(lua.stderr.some((l) => /Lua server #1 ALONE uses .*, over the memory limit of 1 MB: it stops whenever it is not in use/.test(l)), 'a server alone over the limit is named loudly');
+
+// A shared server (the Svelte stub) idle with all its folders live stays over
+// the limit: stopping it frees nothing the next request wouldn't take back.
+const sharedEnv = { LSP_KIT_PIPE: privatePipe(), LSP_KIT_MAX_MEMORY_MB: '1', LSP_KIT_IDLE_MS: '20000', STUB_ANSWER_AFTER: join(base, 'answer-hovers') };
+const idleShared = startProxy('svelte', repo, { ...sharedEnv, name: 'idle shared' });
+await idleShared.initialize(repo);
+await idleShared.req('textDocument/hover', { textDocument: { uri: pathToFileURL(join(repo, 'a.svelte')).href }, position: { line: 1, character: 0 } }); // answered
+const keptShared = () => idleShared.stderr.some((l) => /every server left is in use or serves only live folders/.test(l));
+await wait(12000); // past two ticks (a quarter of IDLE_MS) unused
+check(keptShared() && !idleShared.stderr.some((l) => /stopping Svelte server/.test(l)), 'an idle shared server whose folders are all live is never stopped for the limit');
+// A checkout outside the stub's folders restarts it (it reads them only at
+// initialize); the old stub fails the hover in flight late, at its shutdown,
+// and the new one answers it, the marker existing by then.
+const lost = idleShared.req('textDocument/hover', { textDocument: { uri: pathToFileURL(join(repo, 'a.svelte')).href }, position: { line: 0, character: 1 } });
+await wait(300);
+writeFileSync(sharedEnv.STUB_ANSWER_AFTER, '');
+const other = join(realpathSync.native(base), 'other');
+mkdirSync(join(other, 'node_modules'), { recursive: true });
+cpSync(join(repo, 'node_modules', 'svelte-language-server'), join(other, 'node_modules', 'svelte-language-server'), { recursive: true });
+writeFileSync(join(other, 'b.svelte'), '<p>other</p>\n');
+sh('git init -q && git add -A && git -c user.email=t@t -c user.name=t commit -qm init', other);
+const joiner = startProxy('svelte', other, { ...sharedEnv, name: 'joiner' });
+await joiner.initialize(other);
+await joiner.req('textDocument/hover', { textDocument: { uri: pathToFileURL(join(other, 'b.svelte')).href }, position: { line: 1, character: 0 } });
+const resent = await Promise.race([lost, wait(10000).then(() => ({ error: 'no answer in 10 s' }))]);
+check(!resent?.error && idleShared.stderr.some((l) => /restarting Svelte server #1 with its 2 live folders, resending 1 in flight/.test(l)), `a restart resends the request in flight to the new server, which answers it: ${JSON.stringify(resent)}`);
+await joiner.close();
+await idleShared.close();
 
 // ---- the free memory floor --------------------------------------------------------
 // A floor of twice the machine's memory keeps free memory under it at every

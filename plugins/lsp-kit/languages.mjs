@@ -1,9 +1,15 @@
 // The languages lsp-kit serves; `results` holds per-method response rewrites.
+// `shared`: one server serves every checkout as a workspace folder (manager.mjs),
+// one per server binary (`server(root).identity`, else its command).
+// `foldersAtStart`: the server reads its folders only at initialize; a
+// checkout outside them restarts it.
+// `settings(root)`: a folder's part of the server's settings (arrays, joined
+// across folders), sent as initializationOptions and as the `section` it pulls.
 import { exec, execFileSync, execSync } from 'node:child_process';
-import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { existsSync, promises as fs, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { homedir } from 'node:os';
-import { delimiter, dirname, join } from 'node:path';
+import { basename, delimiter, dirname, join } from 'node:path';
 import { promisify } from 'node:util';
 import { dataDir } from './rpc.mjs';
 
@@ -22,10 +28,19 @@ export const LANGUAGES = {
 		extensionToLanguage: extensionsOf('svelte'),
 		note: 'TypeScript-aware: definitions and references include the .ts/.js files a component imports',
 		watch: [...TS_EXTENSIONS, '.json', '.svelte'],
+		shared: true,
+		// svelte-language-server (0.18) reads workspaceFolders only at initialize,
+		// with no didChangeWorkspaceFolders handler; a checkout outside them got
+		// wrong answers (measured). A .svelte file outside its tsconfig's include
+		// and not imported falls back to the nearest folder, which it crawls
+		// (configLoader.loadConfigs, readDirectory): so the folders are the
+		// outermost checkouts, never a drive root (manager.mjs, toldOf).
+		foldersAtStart: true,
 		server: (root) => {
 			const path = svelteServer(root);
 			if (!path) throw new Error('svelte-language-server not found (npm install -g svelte-language-server)');
-			return { command: process.execPath, args: [path, '--stdio'] };
+			const { version } = JSON.parse(readFileSync(join(path, '..', '..', 'package.json'), 'utf8'));
+			return { command: process.execPath, args: [path, '--stdio'], identity: `svelte-language-server ${version}` };
 		},
 		present: (root) => SVELTE_CONFIGS.some((f) => existsSync(join(root, f))),
 		available: (root) => !!svelteServer(root)
@@ -38,6 +53,7 @@ export const LANGUAGES = {
 		extensionToLanguage: extensionsOf('typescript'),
 		note: 'TypeScript 7, also for a TypeScript 6 project (TypeScript 7 semantics: a tsconfig option it removed, such as baseUrl, breaks resolution and empties answers); findReferences from a .ts/.js symbol misses its uses in .svelte files (ask from a .svelte use for those), and its errors about *.svelte modules (TS2614 for the named export of a component, say) are its blind spot: svelte-check is the authority',
 		watch: [...TS_EXTENSIONS, '.json'],
+		shared: true,
 		server: typescriptServer,
 		present: (root) => TS_MARKERS.some((f) => existsSync(join(root, f))),
 		available: (root) => !!typescript7(root)
@@ -47,9 +63,11 @@ export const LANGUAGES = {
 		extensionToLanguage: extensionsOf('rust'),
 		note: 'every crate in the repo, including nested ones; answers come back empty for ~15 s while it indexes, so retry an empty first result',
 		watch: ['.rs', '.toml'],
+		shared: true,
 		server: (root) => ({ command: rustAnalyzer(root), args: [] }),
 		// rust-analyzer alone only finds Cargo.toml at its root and one level down.
-		initializationOptions: (root) => ({ linkedProjects: cargoManifests(root) }),
+		settings: (root) => ({ linkedProjects: cargoManifests(root) }),
+		section: 'rust-analyzer',
 		present: (root) => cargoManifests(root, 1).length > 0,
 		available: () => onPath('rust-analyzer')
 	},
@@ -221,12 +239,51 @@ function typescript7(root) {
 	return { ...found, exe: native && join(dirname(native), 'lib', process.platform === 'win32' ? 'tsc.exe' : 'tsc'), project: project?.version };
 }
 
+// A running tsc can't be deleted or replaced on Windows, so the shared server,
+// which outlives any one checkout, runs a copy of the platform package in the
+// plugin data folder, one per version: from a checkout's node_modules it would
+// lock that checkout against npm install and worktree removal, from npm's
+// global folder against npm i -g. The copy is made off the manager's thread
+// (`prepare`, manager.mjs), into a .part folder named by the copying process.
+const copies = new Map(); // copy folder -> its copy in progress
+function copyOutside(ts) {
+	const copy = join(dataDir(), `lsp-kit-typescript-${ts.version}-${process.platform}-${process.arch}`);
+	const command = join(copy, 'lib', basename(ts.exe));
+	if (existsSync(copy)) return { command };
+	if (!copies.has(copy)) {
+		const part = `${copy}.${process.pid}.part`;
+		const made = fs.cp(dirname(dirname(ts.exe)), part, { recursive: true })
+			.then(() => fs.rename(part, copy))
+			.catch((e) => fs.rm(part, { recursive: true, force: true }).then(() => {
+				if (!existsSync(copy)) throw new Error(`copying TypeScript ${ts.version} to ${copy} failed: ${e.message}`); // else another manager made it
+			}))
+			.finally(() => copies.delete(copy));
+		copies.set(copy, made);
+	}
+	return { command, prepare: copies.get(copy) };
+}
+// A copy left half made by a process that is gone.
+export function sweepCopies() {
+	for (const name of readdirSync(dataDir())) {
+		const pid = Number(/^lsp-kit-typescript-.*\.(\d+)\.part$/.exec(name)?.[1]);
+		if (pid && !alive(pid)) rmSync(join(dataDir(), name), { recursive: true, force: true });
+	}
+}
+const alive = (pid) => {
+	try {
+		return process.kill(pid, 0);
+	} catch (e) {
+		return e.code === 'EPERM';
+	}
+};
+
 function typescriptServer(root) {
 	const ts = typescript7(root);
 	if (!ts) throw new Error(`TypeScript 7 not found in the project${npmGlobal.error ? ` (and ${npmGlobal.error})` : ` or ${npmGlobal.dir}`}: npm install -g typescript@7`);
 	if (!ts.exe) throw new Error(`TypeScript ${ts.version} in ${ts.dir} lacks its platform package ${PLATFORM_PACKAGE}`);
 	const note = major(ts.project) < 7 ? `the project has TypeScript ${ts.project}; TypeScript ${ts.version} from ${ts.dir} serves it` : undefined;
-	return { command: ts.exe, args: ['--lsp', '--stdio'], note };
+	// Checkouts share a server by version, wherever each finds its copy.
+	return { ...copyOutside(ts), args: ['--lsp', '--stdio'], note, identity: `TypeScript ${ts.version}` };
 }
 
 // The topmost Cargo.toml of every subtree (a workspace manifest covers its
@@ -252,8 +309,8 @@ export function cargoManifests(dir, max = Infinity, found = []) {
 
 // Under rustup, `rust-analyzer` on PATH is rustup's proxy, which runs the
 // toolchain's server as its own child: stopping the proxy can orphan the real
-// server. The toolchain binary is started directly instead, resolved in the
-// server's root on every start, so a checkout pinned by its own
+// server. The toolchain binary is started directly instead, resolved in each
+// checkout as it joins its server, so a checkout pinned by its own
 // rust-toolchain.toml gets that toolchain's server. Without rustup, the PATH
 // binary is the server itself.
 function rustAnalyzer(root) {

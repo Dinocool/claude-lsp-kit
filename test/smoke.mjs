@@ -4,8 +4,8 @@
 //   node test/smoke.mjs <language> <workspaceRoot> <op> <file:line:col> [<file:line:col> ...]
 //
 // op is an LSP method suffix: hover | references | documentSymbol | definition.
-// Files may sit in git worktrees under the root; each should start its own
-// server (watch the "server #n for <root>" lines), capped by the manager.
+// Files may sit in git worktrees under the root; each is a folder of its own
+// (watch the "server #n for <root>" and "adds <root>" lines).
 import { readFileSync } from 'node:fs';
 import { extname, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
